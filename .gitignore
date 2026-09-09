@@ -1,0 +1,16 @@
+# Magisk install artifacts / local test state
+.state/
+state/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local test logs
+*.log
