@@ -136,6 +136,19 @@ To make the overheat tier hold a fixed 90% instead of handing back to the vendor
 
 The core locking mechanism (`setfantestmode`) was discovered via [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). That project does manual speed control only (min 50%, no temperature feedback, does not handle the unlock path). This module adds skin-temperature stepped control, full 0–100% range, overheat handback, and automatic boot takeover via Magisk.
 
+### Troubleshooting
+
+#### EDL 9008 not visible on Windows
+
+This module does not flash the device — it runs on a rooted system via Magisk. So EDL is only needed if you want to back-flash a stock boot image, install Magisk into a partition, or recover a bricked device. If you do need EDL:
+
+- The PICO 4 in EDL mode enumerates as USB **VID:PID 05c6:9008** (Qualcomm 9008, "Android Bootloader").
+- Stock Windows does not ship an INF for this. The device shows as "Unknown device" or under the wrong class, and flashing tools (QFIL, EDLFlash, Firehose) cannot see the port.
+- Fix: rebind the port to **WinUSB** using [zadig.exe](https://zadig.akeo.ie/). Open zadig, *Device → List All Devices*, find `05c6:9008`, install WinUSB.
+- A helper script is included: `powershell -ExecutionPolicy Bypass -File .\diag_windows_edl.ps1` lists any EDL-class device and the driver bound to it; add `-Fix` to attempt a rebind.
+
+If you cannot see the port at all even after rebind, try a different USB cable / port, or re-enter EDL with `fastboot oem edl` (requires unlocked bootloader and root).
+
 ---
 
 ## 中文
@@ -264,6 +277,19 @@ STARTUP_GRACE=45     # 开机后等多久再接管
 
 核心锁定机制（`setfantestmode`）是通过 [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl) 发现的。该项目只做手动调速（最低 50%、无温度反馈、不处理解锁路径）。本模块增加了皮肤温度分档控制、0–100% 全范围、过热交回、以及通过 Magisk 开机自动接管。
 
+### 故障排查
+
+#### Windows 上找不到 EDL 9008 端口
+
+本模块不刷设备——它是 Magisk 模块，跑在已 root 的系统上。所以只有在你想要回刷官方 boot 镜像、把 Magisk 装到分区、或恢复变砖设备时才会用到 EDL。如果你确实需要 EDL：
+
+- PICO 4 进 EDL 模式后枚举为 USB **VID:PID 05c6:9008**（Qualcomm 9008，"Android Bootloader"）。
+- Windows 默认不附带这个 VID 的 INF。设备显示成「未知设备」或归到错误的类别下，刷机工具（QFIL、EDLFlash、Firehose）看不到这个端口。
+- 解决：用 [zadig.exe](https://zadig.akeo.ie/) 把端口重绑定为 **WinUSB**。打开 zadig，*设备 → 列出所有设备*，找到 `05c6:9008`，安装 WinUSB。
+- 仓库里附了辅助脚本：`powershell -ExecutionPolicy Bypass -File .\diag_windows_edl.ps1` 列出所有 EDL 类设备和它们当前绑定的驱动；加 `-Fix` 参数可尝试自动重绑定。
+
+如果重绑后还是看不到端口，换 USB 线/换 USB 口试试，或者用 `fastboot oem edl` 重新进 EDL（需要先解锁 bootloader 且有 root）。
+
 ---
 
 ## Русский
@@ -391,6 +417,19 @@ STARTUP_GRACE=45     # сколько ждать после загрузки
 ### Благодарности
 
 Ключевой механизм блокировки (`setfantestmode`) обнаружен через [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). Тот проект выполняет только ручное управление скоростью (минимум 50%, без обратной связи по температуре, без обработки пути разблокировки). Этот модуль добавляет ступенчатое управление по температуре кожи, полный диапазон 0–100%, возврат при перегреве и автоматический перехват при загрузке через Magisk.
+
+### Устранение неполадок
+
+#### Порт EDL 9008 не виден в Windows
+
+Этот модуль не прошивает устройство — это Magisk-модуль, работающий в root-системе. Так что EDL нужен только если вы хотите переписать заводской boot-образ, установить Magisk в раздел или восстановить «кирпич». Если EDL нужен:
+
+- PICO 4 в режиме EDL отображается как USB **VID:PID 05c6:9008** (Qualcomm 9008, "Android Bootloader").
+- Стандартная поставка Windows не содержит INF для этого VID. Устройство показывается как «Неизвестное устройство» или в неправильном классе, и прошивочные утилиты (QFIL, EDLFlash, Firehose) не видят порт.
+- Решение: перепривязать порт к **WinUSB** через [zadig.exe](https://zadig.akeo.ie/). Откройте zadig, *Устройство → Список всех устройств*, найдите `05c6:9008`, установите WinUSB.
+- В репозитории есть вспомогательный скрипт: `powershell -ExecutionPolicy Bypass -File .\diag_windows_edl.ps1` — выводит все EDL-устройства и их текущие драйверы; флаг `-Fix` пытается перепривязать автоматически.
+
+Если порт так и не появляется после перепривязки, попробуйте другой USB-кабель/порт или повторите вход в EDL через `fastboot oem edl` (нужны разблокированный bootloader и root).
 
 ---
 
