@@ -58,17 +58,45 @@ Exiting test mode does not unlock immediately — the MCU still waits for the ve
 
 Temperature source: `/sys/class/thermal/thermal_zone86/temp` (skin-msm-therm-usr, millidegrees C)
 
-| Skin temp | duty | Measured RPM |
-|---|---|---|
-| < 47°C | 45% | 7599 |
-| 47–50°C | 55% | 8972 |
-| 50–53°C | 65% | 10287 |
-| 53–56°C | 78% | 11815 |
+| Skin temp | tier | duty | Measured RPM |
+|---|---|---|---|
+| < 38°C | quiet | 0% | 0 |
+| 38–47°C | idle | 45% | 7599 |
+| 47–50°C | warm | 55% | 8972 |
+| 50–53°C | hot | 65% | 10287 |
+| 53–56°C | very hot | 78% | 11815 |
 | ≥ 56°C | **hand back to stock policy** | vendor decides |
+
+The quiet tier matches what the vendor itself does around 36°C (drops the fan to 0). Without it the module would idle at 45% in a cool room — pure noise for no cooling benefit.
 
 The last tier deliberately hands control back to the stock firmware: when it gets genuinely hot, exiting test mode, restarting the vendor service, and restoring its thermal-protection logic is safer than this module holding a fixed duty. You can change it to a fixed 90% instead — see "Tuning" below.
 
-Thresholds and tiers are variables at the top of `service.sh`; change them and reboot the module.
+**Hysteresis**: tiers move up on the threshold directly, but only move down once the skin has fallen below the threshold minus `HYSTERESIS` (default 400 mC = 0.4°C). A 1-degree wobble at a boundary therefore does not ping-pong the fan every loop.
+
+**RPM cap**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000), the next loop raises duty to `RPM_DUTY` (default 88%) regardless of temperature. This catches the case where skin is still acceptable but the fan is already near max and you want more headroom.
+
+### Tuning
+
+All thresholds and tier duties live in `config.cfg` next to `service.sh`. Edit it, then either:
+
+```sh
+# Re-read config.cfg without rebooting the module:
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
+
+# Or reboot the module (or the device).
+```
+
+Example `config.cfg` (the shipped default):
+
+```
+TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=400
+LOOP_INTERVAL=5
+STARTUP_GRACE=45
+RPM_CAP=12000
+RPM_DUTY=88
+```
 
 ### Usage
 
@@ -77,9 +105,12 @@ After install, the module takes over the fan automatically on boot.
 Manual control (Magisk Manager "Action" button, or from shell):
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"   # status
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"   # enable
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"  # restore stock
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # print duty/rpm/temp/tier + tier table
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # let service.sh drive the fan by temperature
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # restore stock policy
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # pin fan to a fixed 70% until disable/restart
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # walk QUIET->IDLE->WARM->HOT->VERYHOT->QUIET
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # reload config.cfg (kill + respawn service.sh)
 ```
 
 The switch state is written to `state/enabled` and survives reboot.
@@ -186,17 +217,45 @@ gd32ipdservice: L1:retry_cnt=3 ret=4      ← MCU 拒收
 
 温度源：`/sys/class/thermal/thermal_zone86/temp`（skin-msm-therm-usr，单位毫摄氏度）
 
-| 皮肤温度 | duty | 实测 RPM |
-|---|---|---|
-| < 47°C | 45% | 7599 |
-| 47–50°C | 55% | 8972 |
-| 50–53°C | 65% | 10287 |
-| 53–56°C | 78% | 11815 |
+| 皮肤温度 | 档位 | duty | 实测 RPM |
+|---|---|---|---|
+| < 38°C | 安静 | 0% | 0 |
+| 38–47°C | 空闲 | 45% | 7599 |
+| 47–50°C | 温热 | 55% | 8972 |
+| 50–53°C | 较热 | 65% | 10287 |
+| 53–56°C | 很热 | 78% | 11815 |
 | ≥ 56°C | **交回原厂策略** | 由原厂决定 |
+
+安静档对应厂商在 36°C 左右自动停风扇的行为。没有它，模块会在冷房里空转 45%——纯噪音无制冷。
 
 最后一档故意把控制权还给原厂：温度真的过高时，退出测试模式、重启 vendor 服务、恢复原厂降频保护逻辑，比本模块死守一个 duty 安全。要改成固定 90% 也可以，见下方「调整」。
 
-阈值和档位都在 `service.sh` 顶部的变量里，改完重启模块即可生效。
+**滞回**：档位向上跨阈值直接升档，向下则需要皮肤温度跌破 (阈值 - HYSTERESIS) 才降档。默认 HYSTERESIS=400 mC（0.4°C），避免 1°C 抖动让风扇每循环就来回跳档。
+
+**RPM 上限**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000），下一循环把 duty 提到 `RPM_DUTY`（默认 88%），不看温度。这在皮肤温度尚可但风扇已接近满速、想要更多余量时生效。
+
+### 调整
+
+所有阈值和档位都在 `config.cfg` 里。改完后：
+
+```sh
+# 不重启模块即可重读 config.cfg：
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
+
+# 或重启模块/设备。
+```
+
+默认 `config.cfg`（即出厂值）：
+
+```
+TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=400
+LOOP_INTERVAL=5
+STARTUP_GRACE=45
+RPM_CAP=12000
+RPM_DUTY=88
+```
 
 ### 使用方法
 
@@ -205,9 +264,12 @@ gd32ipdservice: L1:retry_cnt=3 ret=4      ← MCU 拒收
 手动控制（Magisk 管理器的「操作」按钮，或直接进 shell）：
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"   # 看当前状态
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"   # 开启本模块温控
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"  # 恢复原厂温控
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # 打印 duty/rpm/温度/档位 + 档位表
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # 让 service.sh 按温度控风扇
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # 恢复原厂策略
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # 固定 70%，直到 disable 或 restart
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # 走档：安静->空闲->温热->较热->很热->安静
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # 重载 config.cfg（杀 service.sh 重启）
 ```
 
 开关状态会写入 `state/enabled`，重启后按上次选择恢复。
@@ -314,17 +376,60 @@ Duty, записанный через `setfantestspeed`, не затрагива
 
 Источник температуры: `/sys/class/thermal/thermal_zone86/temp` (skin-msm-therm-usr, миллисели)
 
-| Т-ра кожи | duty | Измеренные RPM |
-|---|---|---|
-| < 47°C | 45% | 7599 |
-| 47–50°C | 55% | 8972 |
-| 50–53°C | 65% | 10287 |
-| 53–56°C | 78% | 11815 |
+| Т-ра кожи | ступень | duty | Измеренные RPM |
+|---|---|---|---|
+| < 38°C | тихий | 0% | 0 |
+| 38–47°C | свободный | 45% | 7599 |
+| 47–50°C | тёплый | 55% | 8972 |
+| 50–53°C | горячий | 65% | 10287 |
+| 53–56°C | очень горячий | 78% | 11815 |
 | ≥ 56°C | **возврат заводской политики** | решает vendor |
+
+Тихая ступень соответствует заводскому поведению около 36°C (вентилятор выключается). Без неё модуль бы крутил 45% в холодной комнате — только шум, пользы ноль.
 
 Последняя ступень намеренно возвращает управление заводской прошивке: когда становится по-настоящему жарко, выход из тестового режима, перезапуск vendor-сервиса и восстановление заводской логики термозащиты безопаснее, чем удержание фиксированного duty этим модулем. Можно изменить на фиксированные 90% — см. «Настройка» ниже.
 
-Пороги и ступени — переменные в начале `service.sh`; измените и перезапустите модуль.
+**Истерезис**: ступень растёт при переходе порога, а падает только после падения ниже (порог - ИСТЕРЕЗИС). По умолчанию ИСТЕРЕЗИС=400 мС (0.4°C). Температурная дрожь в 1°C не вызывает дребезг вентилятора каждую итерацию.
+
+**Ограничение по RPM**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%), независимо от температуры. Это ловит случай, когда кожа в норме, а вентилятор уже почти на максимуме и нужен запас.
+
+### Настройка
+
+Все пороги и ступени — в `config.cfg` рядом с `service.sh`. Измените, затем:
+
+```sh
+# Перечитать config.cfg без перезагрузки модуля:
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
+
+# Или перезапустите модуль / устройство.
+```
+
+Пример `config.cfg` (установленные по умолчанию значения):
+
+```
+TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=400
+LOOP_INTERVAL=5
+STARTUP_GRACE=45
+RPM_CAP=12000
+RPM_DUTY=88
+```
+
+### Использование
+
+После установки модуль автоматически перехватывает вентилятор при загрузке.
+
+Ручное управление (кнопка «Action» в Magisk Manager или из shell):
+
+```sh
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # duty/об/мин/т-ра/ступень + таблица
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # service.sh управляет вентилятором по температуре
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # вернуть заводскую политику
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # зафиксировать duty=70% до disable или restart
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->тихий
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # перечитать config.cfg (перезапуск service.sh)
+```
 
 ### Использование
 
@@ -333,9 +438,12 @@ Duty, записанный через `setfantestspeed`, не затрагива
 Ручное управление (кнопка «Action」в Magisk Manager или из shell):
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"   # статус
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"   # включить
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"  # вернуть заводское
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # duty/об/мин/т-ра/ступень + таблица
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # service.sh управляет вентилятором по температуре
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # вернуть заводскую политику
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # зафиксировать duty=70% до disable или restart
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->тихий
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # перечитать config.cfg (перезапуск service.sh)
 ```
 
 Состояние переключателя записывается в `state/enabled` && переживает перезагрузку.

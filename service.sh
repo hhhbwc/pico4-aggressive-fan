@@ -10,9 +10,10 @@
 #   CPU load and the vendor never raised the fan again.
 #
 # This module replaces that policy with a skin-temperature stepped curve, one
-# tier above the vendor's. At the overheat tier it exits test mode so the
-# vendor's own duty writes are accepted again, letting its high-temp protection
-# logic come back.
+# tier above the vendor's, plus a quiet tier for low ambient (vendor itself
+# drops the fan to 0% around 36C; we match that rather than idling at 45%).
+# At the overheat tier it exits test mode so the vendor's own duty writes are
+# accepted again, letting its high-temp protection logic come back.
 #
 # HOW IT WORKS (no service killing required):
 #   /system/bin/gd32ipdclient_test setfantestmode 1
@@ -30,6 +31,10 @@
 # "79 00 00 00 28 23 00 00 01 73" is then accepted with ret=10). So the
 # overheat path below toggles pxrfanservice to force that re-handshake.
 #
+# Tuning lives in config.cfg next to this script, so users can edit
+# thresholds without recompiling the script. The defaults below are used if
+# the file is absent or a value is missing.
+#
 # NOTE: runs as root from Magisk; gd32ipdclient_test talks to a root-only
 # binder service.
 
@@ -39,29 +44,58 @@ LOG_TAG="PicoFanTC"
 MODDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 [ -d "$MODDIR" ] || MODDIR="/data/adb/modules/pico4_fan_tempcontrol"
 STATE_DIR="$MODDIR/state"
+CONFIG_FILE="$MODDIR/config.cfg"
 ENABLED="$STATE_DIR/enabled"
 CUR_DUTY="$STATE_DIR/cur_duty"
+CUR_TIER="$STATE_DIR/cur_tier"
 IN_TEST="$STATE_DIR/in_test"
+LOG_FILE="$STATE_DIR/last_run.log"
 
 TOOL="/system/bin/gd32ipdclient_test"
 TEMP_NODE="/sys/class/thermal/thermal_zone86/temp"   # skin-msm-therm-usr, millidegrees C
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 
-# Tier table, lowest first. Overheat hands control back to the vendor.
-TIER_IDLE="45"
-TIER_WARM="55"
-TIER_HOT="65"
-TIER_VERYHOT="78"
+# ---------------------------------------------------------------------------
+# Defaults. Override from $CONFIG_FILE if present.
+# ---------------------------------------------------------------------------
+
+# Tier table, lowest first. Each is a duty percent 0-100.
+TIER_QUIET="0"        # skin < 38C, ambient is cold; no fan needed
+TIER_IDLE="45"        # 38-47C
+TIER_WARM="55"        # 47-50C
+TIER_HOT="65"         # 50-53C
+TIER_VERYHOT="78"     # 53-56C
 
 # Thresholds, in millidegrees C.
+T0=38000   # quiet -> idle (below this, fan off)
 T1=47000   # idle -> warm
 T2=50000   # warm -> hot
 T3=53000   # hot -> very hot
 T4=56000   # very hot -> overheat (hand back to vendor)
 
+# Hysteresis in millidegrees C. To move DOWN from a tier, the skin must drop
+# below the tier's lower threshold minus HYSTERESIS, so a single-degree wobble
+# at a boundary does not ping-pong the fan.
+HYSTERESIS=400
+
 LOOP_INTERVAL=5          # seconds
 STARTUP_GRACE=45         # seconds after boot before taking over
+
+# RPM cap: if the MCU reports an rpm above this, raise the duty to RPM_DUTY
+# next loop. This catches the case where skin is still acceptable but the fan
+# is already spinning near max and we want more headroom.
+RPM_CAP=12000
+RPM_DUTY=88
+
+# ---------------------------------------------------------------------------
+# Load config.cfg if present. Each line is KEY=VALUE, '#' starts a comment.
+# Anything unrecognised is silently ignored so future keys do not break this.
+# ---------------------------------------------------------------------------
+
+if [ -r "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE" 2>/dev/null
+fi
 
 log() {
     # Use the absolute path: naming this function "log" shadows the binary, so a
@@ -102,6 +136,11 @@ get_duty() {
     return 1
 }
 
+get_rpm() {
+    out="$($TOOL getfaninfo 2>/dev/null)"
+    echo "$out" | sed -n 's/^rpm=\([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
 # ---------------------------------------------------------------------------
 # Test mode (the MCU-side lock)
 # ---------------------------------------------------------------------------
@@ -136,8 +175,17 @@ exit_test_mode() {
 }
 
 # ---------------------------------------------------------------------------
-# Tier selection. Reads the skin sensor; on read failure keeps the last known
-# duty rather than guessing, so a transient sensor glitch cannot drop the fan.
+# Tier selection with hysteresis.
+#
+# Without hysteresis, a 1-degree wobble around a threshold flips the fan
+# every loop. With hysteresis, going UP uses the threshold directly, going
+# DOWN requires the skin to fall below (threshold - HYSTERESIS). So a sample
+# at exactly T1 moves up but not back down on the next loop unless it drops
+# to T1-HYSTERESIS.
+#
+# The function prints one of:
+#   QUIET, IDLE, WARM, HOT, VERYHOT, OVERHEAT
+# or returns 1 if the sensor cannot be read.
 # ---------------------------------------------------------------------------
 
 pick_tier() {
@@ -145,18 +193,49 @@ pick_tier() {
     case "$t" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    if [ "$t" -ge "$T4" ]; then
-        echo "OVERHEAT"
-    elif [ "$t" -ge "$T3" ]; then
-        echo "$TIER_VERYHOT"
-    elif [ "$t" -ge "$T2" ]; then
-        echo "$TIER_HOT"
-    elif [ "$t" -ge "$T1" ]; then
-        echo "$TIER_WARM"
-    else
-        echo "$TIER_IDLE"
+    prev=$(cat "$CUR_TIER" 2>/dev/null)
+    case "$prev" in
+        QUIET|IDLE|WARM|HOT|VERYHOT) ;;
+        *) prev=IDLE ;;   # unknown / first run: behave like IDLE
+    esac
+
+    # Upward check first (no hysteresis): any new threshold crossed moves up.
+    if [ "$t" -ge "$T4" ]; then echo "OVERHEAT"; return 0; fi
+    if [ "$t" -ge "$T3" ]; then echo "VERYHOT"; return 0; fi
+    if [ "$t" -ge "$T2" ]; then echo "HOT";     return 0; fi
+    if [ "$t" -ge "$T1" ]; then echo "WARM";    return 0; fi
+    if [ "$t" -ge "$T0" ]; then echo "IDLE";    return 0; fi
+
+    # Below T0. If we were QUIET already, stay. If we were above, only drop
+    # into QUIET after the skin has been below T0-HYSTERESIS for one sample.
+    q=$(($T0 - HYSTERESIS))
+    if [ "$t" -lt "$q" ]; then
+        echo "QUIET"
+        return 0
     fi
+    if [ "$prev" = "QUIET" ]; then
+        echo "QUIET"
+        return 0
+    fi
+    # Not yet cool enough to drop into QUIET from a warmer tier.
+    echo "IDLE"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# Resolve a tier label to its duty percent.
+# ---------------------------------------------------------------------------
+
+tier_duty() {
+    case "$1" in
+        QUIET)   echo "$TIER_QUIET" ;;
+        IDLE)    echo "$TIER_IDLE" ;;
+        WARM)    echo "$TIER_WARM" ;;
+        HOT)     echo "$TIER_HOT" ;;
+        VERYHOT) echo "$TIER_VERYHOT" ;;
+        OVERHEAT) echo "" ;;   # not a duty; caller handles handback
+        *) return 1 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -221,6 +300,7 @@ main() {
     fi
 
     cur=""
+    cur_duty_written=""
     n=0
     while : ; do
         tier=$(pick_tier)
@@ -238,6 +318,7 @@ main() {
                 exit_test_mode
                 rm -f "$ENABLED"
                 cur=""
+                cur_duty_written=""
                 log "skin $((t / 1000))C over heat, MCU test mode exited, vendor policy restored"
             fi
             sleep "$LOOP_INTERVAL"
@@ -250,24 +331,38 @@ main() {
             if enter_test_mode; then
                 log "re-engaged MCU test mode (was disengaged at skin $((t / 1000))C)"
                 cur=""
+                cur_duty_written=""
             fi
         fi
 
-        # Hysteresis: only touch the fan when the tier actually changes, so the
-        # MCU is not ping-ponged on a single-degree wobble.
-        if [ "$tier" = "$cur" ]; then
+        # RPM-based escalation: if the fan is already near max and skin is
+        # acceptable, raise the duty for more headroom. This is independent
+        # of the tier so it can override a "hold" loop.
+        rpm_now=$(get_rpm)
+        if [ -n "$rpm_now" ] && [ "$RPM_CAP" -gt 0 ] && [ "$rpm_now" -ge "$RPM_CAP" ] 2>/dev/null; then
+            cur_tier_name="RPM-CAP"
+            desired="$RPM_DUTY"
+        else
+            cur_tier_name="$tier"
+            desired=$(tier_duty "$tier")
+            [ -z "$desired" ] && { sleep "$LOOP_INTERVAL"; continue; }
+        fi
+
+        # Hysteresis: only touch the fan when the desired duty actually changes.
+        if [ "$desired" = "$cur_duty_written" ]; then
             sleep "$LOOP_INTERVAL"
             continue
         fi
 
-        if set_duty "$tier"; then
+        if set_duty "$desired"; then
             got=$(get_duty 4)
-            cur="$tier"
-            echo "$tier" > "$CUR_DUTY"
+            cur_duty_written="$desired"
+            echo "$desired" > "$CUR_DUTY"
+            echo "$cur_tier_name" > "$CUR_TIER"
             t=$(cat "$TEMP_NODE" 2>/dev/null)
-            log "skin $((t / 1000))C tier -> duty $tier (reported ${got:-?})"
+            log "skin $((t / 1000))C rpm ${rpm_now:-?} -> $cur_tier_name duty $desired (reported ${got:-?})"
         else
-            log "setfantestspeed $tier failed, will retry"
+            log "setfantestspeed $desired failed, will retry"
         fi
 
         n=$((n + 1))
@@ -275,9 +370,9 @@ main() {
         # drifted us away, re-assert without chattering the log.
         if [ $((n % 6)) -eq 0 ]; then
             held=$(get_duty 4)
-            if [ -n "$held" ] && [ "$held" != "$cur" ]; then
-                log "drift detected: wanted $cur, MCU reports $held, re-asserting"
-                set_duty "$cur" >/dev/null 2>&1
+            if [ -n "$held" ] && [ "$held" != "$cur_duty_written" ]; then
+                log "drift detected: wanted $cur_duty_written, MCU reports $held, re-asserting"
+                set_duty "$cur_duty_written" >/dev/null 2>&1
             fi
         fi
 
