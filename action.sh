@@ -11,20 +11,24 @@
 #
 #   status   - print current duty/rpm/skin temp/tier/vendor state + tier table
 #   enable   - enter MCU test mode and let service.sh drive the fan
-#   disable  - exit test mode, restore stock policy
+#   disable  - exit test mode, restore stock policy (persistent across reboot)
 #   set N    - pin the fan to a fixed duty N% (0-100) until restart or disable
 #   cycle    - walk through QUIET -> IDLE -> WARM -> HOT -> VERYHOT -> (back to QUIET)
 #   restart  - kill and respawn service.sh (picks up config.cfg edits)
-#   auto     - follow the persisted state/enabled flag (what boot does)
+#   auto     - follow the persisted state flag (what boot does)
 #
-# The enable/disable choice is persisted in state/enabled, so a reboot keeps
-# the user's last choice.
+# 修补说明：上游的 disable 其实不持久 —— 它把 enabled 和 in_test 都删掉，
+# 于是重启后 service.sh 会走到"自动接管"分支又自己开起来，表现为
+# "明明关了，重启自己又开了"。修补版新增 state/disabled 标记：
+#   disable / off -> 写 disabled，service.sh 重启后不再自动接管
+#   enable  / on  / set / cycle -> 清掉 disabled
 
 MODDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 [ -d "$MODDIR" ] || MODDIR="/data/adb/modules/pico4_fan_tempcontrol"
 STATE_DIR="$MODDIR/state"
 CONFIG_FILE="$MODDIR/config.cfg"
 ENABLED="$STATE_DIR/enabled"
+DISABLED="$STATE_DIR/disabled"
 IN_TEST="$STATE_DIR/in_test"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
@@ -36,11 +40,21 @@ SVC="$MODDIR/service.sh"
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 # Load the same config the service uses, so status shows real thresholds.
-TIER_QUIET=0; TIER_IDLE=45; TIER_WARM=55; TIER_HOT=65; TIER_VERYHOT=78
-T0=38000; T1=47000; T2=50000; T3=53000; T4=56000
-HYSTERESIS=400
+TIER_QUIET=0; TIER_IDLE=25; TIER_WARM=55; TIER_HOT=65; TIER_VERYHOT=78
+T0=41000; T1=47000; T2=50000; T3=53000; T4=56000
+HYSTERESIS=800
+RPM_CAP=12000; RPM_DUTY=88; RPM_RELEASE_RANK=3
+OVERHEAT_RELEASE_RANK=3
 if [ -r "$CONFIG_FILE" ]; then
-    . "$CONFIG_FILE" 2>/dev/null
+    # 与 service.sh 一致：先去掉 CR，避免 CRLF 配置里的回车跑进状态表和 duty 值。
+    CFG_NORM="$STATE_DIR/config.norm"
+    if command -v tr >/dev/null 2>&1 \
+       && tr -d '\r' < "$CONFIG_FILE" > "$CFG_NORM" 2>/dev/null; then
+        . "$CFG_NORM" 2>/dev/null
+        rm -f "$CFG_NORM" 2>/dev/null
+    else
+        . "$CONFIG_FILE" 2>/dev/null
+    fi
 fi
 
 CMD="${1:-auto}"
@@ -56,6 +70,23 @@ vendor_running() {
 
 is_pinned() {
     [ -f "$PINNED" ]
+}
+
+is_disabled() {
+    [ -f "$DISABLED" ]
+}
+
+service_running() {
+    pgrep -f "$SVC" >/dev/null 2>&1
+}
+
+# enable/on/set/cycle 之后，如果 service.sh 已经因为 disabled 退出，重新拉起它。
+ensure_service() {
+    service_running && return 0
+    nohup sh "$SVC" >/dev/null 2>&1 &
+    sleep 1
+    service_running && echo "已重新拉起 service.sh"
+    return 0
 }
 
 take_over() {
@@ -93,7 +124,7 @@ pin_duty() {
     fi
     out=$($TOOL setfantestspeed "$1" 2>/dev/null)
     case "$out" in
-        *success*) echo "$1" > "$PINNED"; echo "已固定 duty=$1%" ;;
+        *success*) echo "$1" > "$PINNED"; rm -f "$DISABLED"; echo "已固定 duty=$1%" ;;
         *) echo "固定失败"; return 1 ;;
     esac
     # Kill service.sh so it does not re-evaluate and override the pin.
@@ -104,10 +135,6 @@ pin_duty() {
 cycle_step() {
     # Walk through tiers in order. Each invocation moves one step forward,
     # wrapping from VERYHOT back to QUIET.
-    #
-    # POSIX sh gotcha: "for s in $var" splits on IFS (space/newline/tab), but
-    # "for s in \"$var\"" treats the whole string as a single word. We must
-    # use the unquoted form or `set --` first.
     tiers="QUIET IDLE WARM HOT VERYHOT"
 
     # Locate current tier index (0-based). Default to QUIET (0) if unknown.
@@ -148,6 +175,7 @@ cycle_step() {
     out=$($TOOL setfantestspeed "$d" 2>/dev/null)
     case "$out" in
         *success*) echo "已切到 $next 档 (duty=$d%)"
+                   rm -f "$DISABLED"
                    pkill -f "$(basename "$SVC")" 2>/dev/null
                    return 0 ;;
         *) echo "切档失败"; return 1 ;;
@@ -155,8 +183,6 @@ cycle_step() {
 }
 
 tier_table() {
-    # Print the tier table using the current config values, so the user can
-    # see what they are about to live with without opening service.sh.
     echo "档位表 (来自 config.cfg):"
     printf "  < %-5sC  quiet   duty=%s%%\n" "$((T0 / 1000))" "$TIER_QUIET"
     printf "  %-5s-%-5sC  idle    duty=%s%%\n" "$((T0 / 1000))" "$((T1 / 1000))" "$TIER_IDLE"
@@ -164,15 +190,23 @@ tier_table() {
     printf "  %-5s-%-5sC  hot     duty=%s%%\n" "$((T2 / 1000))" "$((T3 / 1000))" "$TIER_HOT"
     printf "  %-5s-%-5sC  vhot    duty=%s%%\n" "$((T3 / 1000))" "$((T4 / 1000))" "$TIER_VERYHOT"
     printf "  >= %sC       交回原厂策略\n" "$((T4 / 1000))"
-    printf "  滞回 HYSTERESIS=%s mC (%sC)\n" "$HYSTERESIS" "$(awk "BEGIN{printf \"%.1f\", $HYSTERESIS/1000}")"
+    printf "  回滞 HYSTERESIS=%s mC (%sC) | RPM 升速闸门档位=%s | 过热重新接管档位=%s\n" \
+        "$HYSTERESIS" "$(awk "BEGIN{printf \"%.1f\", $HYSTERESIS/1000}")" \
+        "$RPM_RELEASE_RANK" "$OVERHEAT_RELEASE_RANK"
 }
 
 status() {
     echo "== 风扇温控状态 =="
-    if in_test_mode; then
-        if is_pinned; then
+    if is_disabled; then
+        echo "模式: 已关闭 (持久，重启保持) — vendor 控制，action.sh enable 可恢复"
+    elif is_pinned; then
+        if in_test_mode; then
             echo "模式: 手动固定 (duty=$(cat "$PINNED")%)"
-        elif [ -f "$ENABLED" ]; then
+        else
+            echo "模式: 手动固定记录存在，但 MCU test mode 未生效 (风扇归 vendor)"
+        fi
+    elif in_test_mode; then
+        if [ -f "$ENABLED" ]; then
             echo "模式: 本模块温控 (duty 由皮肤温度决定)"
         else
             echo "模式: MCU test mode 已开，但 service.sh 未运行"
@@ -197,6 +231,7 @@ status() {
     printf "皮肤温度 %s°C | 风扇 duty=%s%% rpm=%s\n" "$t_c" "${d:-?}" "${r:-?}"
     printf "vendor=%s | 当前档=%s (上次写入 duty=%s)\n" "${v:-?}" "$cur_tier" "$cur_duty"
     [ -n "$svc" ] && printf "service.sh PID=%s\n" "$svc"
+    printf "标记: %s\n" "$(ls "$STATE_DIR" 2>/dev/null | tr '\n' ' ')"
 
     echo ""
     tier_table
@@ -221,13 +256,14 @@ case "$CMD" in
         status
         ;;
     enable)
-        if pin_to=$(cat "$PINNED" 2>/dev/null); then :; fi
         if is_pinned; then
             rm -f "$PINNED"
         fi
         if take_over; then
             : > "$ENABLED"
-            echo "已开启本模块温控"
+            rm -f "$DISABLED"
+            echo "已开启本模块温控 (持久)"
+            ensure_service
         else
             echo "开启失败 (setfantestmode 1 被拒绝)"
         fi
@@ -236,7 +272,9 @@ case "$CMD" in
     disable)
         if hand_back; then
             rm -f "$ENABLED"
-            echo "已恢复原厂温控"
+            : > "$DISABLED"
+            echo "已恢复原厂温控 (持久，重启不会自动接管)"
+            echo "正在运行的 service.sh 会在一个周期内自行交回并退出"
         else
             echo "恢复失败 (vendor 服务未能重新握手)"
         fi
@@ -262,20 +300,25 @@ case "$CMD" in
         restart_service
         status
         ;;
+    selftest)
+        sh "$SVC" --selftest
+        ;;
     auto|off|on)
         # 'auto' means: follow whatever the flag says, which is what boot does.
         # 'on'  = take over, 'off' = hand back. Kept short for convenience.
         if [ "$CMD" = "on" ]; then
-            take_over && : > "$ENABLED" || exit 1
-            echo "已开启本模块温控"
+            take_over && : > "$ENABLED" && rm -f "$DISABLED" || exit 1
+            echo "已开启本模块温控 (持久)"
+            ensure_service
         elif [ "$CMD" = "off" ]; then
-            hand_back && rm -f "$ENABLED" || exit 1
-            echo "已恢复原厂温控"
+            hand_back && rm -f "$ENABLED" && : > "$DISABLED" || exit 1
+            echo "已恢复原厂温控 (持久)"
+            echo "正在运行的 service.sh 会在一个周期内自行交回并退出"
         fi
         status
         ;;
     *)
-        echo "用法: action.sh [status|enable|disable|set <0-100>|cycle|restart|on|off|auto]"
+        echo "用法: action.sh [status|enable|disable|set <0-100>|cycle|restart|selftest|on|off|auto]"
         exit 1
         ;;
 esac

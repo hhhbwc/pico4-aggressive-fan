@@ -6,6 +6,10 @@
 
 A Magisk module that replaces PICO 4's stock fan curve with a skin-temperature stepped curve, one tier higher. Uses GD32 MCU test mode to bypass the stock 35% duty lock — the vendor service (`pxrfanservice`) stays running untouched.
 
+> **v1.3.0** fixes several defects that made the module silently lose control of the fan — a stale test-mode flag, an RPM escalation rule that never released, hysteresis that was documented but never implemented, a non-persistent `disable`, and CRLF line endings breaking the scripts outright. Details and measured evidence: [CHANGELOG.md](CHANGELOG.md).
+>
+> If you are upgrading from v1.2.0, re-check `config.cfg`: the shipped `T0` (38000 → 41000) and `TIER_IDLE` (45 → 25) changed, and four new keys were added. Your existing file is read as-is, so delete it to pick up the new defaults.
+
 **核心机制**: `setfantestmode 1` puts the GD32 MCU into test mode, where it rejects the vendor's `SetFanSpeed` frames at the firmware level. The vendor keeps running its temperature sampling and state machine — only its duty writes stop reaching the motor.
 
 ---
@@ -60,20 +64,32 @@ Temperature source: `/sys/class/thermal/thermal_zone86/temp` (skin-msm-therm-usr
 
 | Skin temp | tier | duty | Measured RPM |
 |---|---|---|---|
-| < 38°C | quiet | 0% | 0 |
-| 38–47°C | idle | 45% | 7599 |
-| 47–50°C | warm | 55% | 8972 |
-| 50–53°C | hot | 65% | 10287 |
-| 53–56°C | very hot | 78% | 11815 |
+| < 41°C | quiet | 0% | 0 |
+| 41–47°C | idle | 25% | 4346 |
+| 47–50°C | warm | 55% | ~9000 |
+| 50–53°C | hot | 65% | ~10600 |
+| 53–56°C | very hot | 78% | 12220 |
 | ≥ 56°C | **hand back to stock policy** | vendor decides |
 
-The quiet tier matches what the vendor itself does around 36°C (drops the fan to 0). Without it the module would idle at 45% in a cool room — pure noise for no cooling benefit.
+Measured duty → RPM curve on a PICO A8110:
 
-The last tier deliberately hands control back to the stock firmware: when it gets genuinely hot, exiting test mode, restarting the vendor service, and restoring its thermal-protection logic is safer than this module holding a fixed duty. You can change it to a fixed 90% instead — see "Tuning" below.
+| duty | 0% | 15% | 20% | 25% | 30% | 35% | 45% | 65% | 78% | 88% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-**Hysteresis**: tiers move up on the threshold directly, but only move down once the skin has fallen below the threshold minus `HYSTERESIS` (default 400 mC = 0.4°C). A 1-degree wobble at a boundary therefore does not ping-pong the fan every loop.
+About 3450 RPM is the slowest the fan will actually turn, so any duty under ~15% is effectively "off".
 
-**RPM cap**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000), the next loop raises duty to `RPM_DUTY` (default 88%) regardless of temperature. This catches the case where skin is still acceptable but the fan is already near max and you want more headroom.
+**Why `T0` is 41°C and not 38°C.** A PICO 4 sitting idle with the screen off measures 37.5–40°C skin. A 38°C threshold therefore sits directly on the idle temperature, and with a first tier of 45% (~7500 RPM) that produced a 0 ↔ 7500 RPM flap: the fan audibly spinning up and stopping again every few minutes on a headset nobody was using.
+
+The quiet tier matches what the vendor itself does around 36°C (drops the fan to 0).
+
+The last tier deliberately hands control back to the stock firmware: when it gets genuinely hot, exiting test mode, restarting the vendor service, and restoring its thermal-protection logic is safer than this module holding a fixed duty. Control is taken back only once the skin has fallen to the `HOT` tier again (`OVERHEAT_RELEASE_RANK`, default 3) — releasing it and immediately re-grabbing it five seconds later would defeat the whole point.
+
+**Hysteresis**: tiers move up the moment a threshold is crossed, but move down only once the skin has fallen below `threshold − HYSTERESIS` (default 800 mC = 0.8°C). A wobble at a boundary therefore does not ping-pong the fan every loop. (In v1.2.0 this was documented but not actually implemented outside the quiet tier — the parameter had no effect.)
+
+**RPM cap, temperature-gated**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000) **and** the temperature tier is at least `RPM_RELEASE_RANK` (default 3 = hot, i.e. skin ≥ 50°C), the next loop raises duty to `RPM_DUTY` (default 88%).
+
+The temperature gate is what keeps this safe. Without it the rule latches permanently, and it does so in a way that looks fine in a code read: rpm ≥ 12000 sets duty to 88%; at duty 88% the fan reports ≥ 12000 rpm; so the condition is true again forever — and it bypasses the temperature table entirely. The only way out would be a lower duty, which requires rpm to already be under the cap. Measured rpm really does reach 13671 at duty 88%, so this was reachable in ordinary use and the fan would sit near full speed at idle until reboot. With the gate it drops back as soon as the skin returns below 50°C.
 
 ### Tuning
 
@@ -89,14 +105,20 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 Example `config.cfg` (the shipped default):
 
 ```
-TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
-HYSTERESIS=400
+TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
 RPM_CAP=12000
 RPM_DUTY=88
+RPM_RELEASE_RANK=3
+OVERHEAT_RELEASE_RANK=3
+RETRY_BACKOFF=3
+FAIL_LOG_EVERY=12
 ```
+
+The file is read with CR stripped, so saving it with a Windows editor (Notepad etc.) that writes CRLF is safe. Keys you leave out fall back to the built-in defaults.
 
 ### Usage
 
@@ -111,9 +133,10 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # restore
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # pin fan to a fixed 70% until disable/restart
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # walk QUIET->IDLE->WARM->HOT->VERYHOT->QUIET
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # reload config.cfg (kill + respawn service.sh)
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # pure-logic check, read-only
 ```
 
-The switch state is written to `state/enabled` and survives reboot.
+The switch state survives reboot (v1.3.0): `state/enabled` means "the module is driving the fan", `state/disabled` means "the user turned it off" — after a `disable` the module will not quietly take over again at boot. `disable` also hands the fan back to the vendor and the running control loop exits by itself.
 
 To restore stock behaviour: disable or uninstall the module. `stop.sh` exits test mode, restarts the vendor service, and returns the fan to stock control.
 
@@ -124,44 +147,50 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 # duty=55 rpm=8530 rpm_target=9000 mode=duty mode
 ```
 
-### Tuning
+### Extended keys (v1.3.0)
 
-Edit the top of `service.sh`:
+Beyond the tier table, `config.cfg` carries a few knobs that did not exist in v1.2.0:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `RPM_RELEASE_RANK` | 3 | Temperature tier (`0` quiet … `4` very hot) required before the RPM-cap rule may raise duty. `3` = only at skin ≥ 50°C. Raise it to keep the fan quieter, lower it for more headroom. |
+| `OVERHEAT_RELEASE_RANK` | 3 | Temperature tier the skin must fall back to before the module retakes control after an overheat handback. |
+| `RETRY_BACKOFF` | 3 | Seconds to wait after a rejected fan write before trying again. |
+| `FAIL_LOG_EVERY` | 12 | Log throttling — only 1 in N consecutive write failures is logged (the first one is always logged). |
+
+To make the overheat tier hold a fixed 90% instead of handing back to the vendor, replace `exit_test_mode` with `set_duty 90` in the `main` loop's overheat branch and drop the `IN_TEST` bookkeeping there — but you then lose the vendor's own high-temperature protection.
+
+### Self-test
 
 ```sh
-TIER_IDLE="45"       # < 47°C
-TIER_WARM="55"       # 47-50°C
-TIER_HOT="65"        # 50-53°C
-TIER_VERYHOT="78"    # 53-56°C
-
-T1=47000   # idle -> warm
-T2=50000   # warm -> hot
-T3=53000   # hot -> very hot
-T4=56000   # very hot -> hand back to vendor
-LOOP_INTERVAL=5      # loop interval (seconds)
-STARTUP_GRACE=45     # how long to wait after boot before taking over
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-To make the overheat tier hold a fixed 90% instead of handing back to the vendor, change `exit_test_mode` to `set_duty 90` in the `main` loop's overheat branch, and remove the `TIER_OVERHEAT` exit logic.
+Runs the tier ladder, hysteresis and RPM gate as pure logic against a scratch state directory. It does not touch the fan or the real sensor node, so it is safe to run any time. Use it to see exactly what a given `config.cfg` will do before you rely on it. `action.sh selftest` is a shorthand for the same thing.
 
 ### Notes
 
 1. **Root required.** `gd32ipdclient_test` talks to a root-only binder service; a plain shell cannot drive it.
 2. **Unofficial method.** Uses PICO's factory test program; no public interface is exposed. Firmware updates may change the paths or parameters. The scripts degrade gracefully if the tool or the temp node is missing, but they will not force-lock the fan — if they cannot get control, they exit and let the vendor take over.
 3. **Vendor service always runs.** It is never killed. Its high-temp protection logic re-activates at the overheat tier. Under normal temperatures you will just be cooler.
-4. **Fan speed ceiling:** duty=100% measures ~12500 RPM. Noise rises noticeably above duty ~85%.
+4. **Fan speed ceiling:** duty 88% measures 13671 RPM; duty 100% is around 12500 on some units. Noise rises noticeably above duty ~85%.
 5. **Uninstall restores stock.** No manual cleanup needed; `stop.sh` exits test mode and restarts the vendor service.
-6. **Auto-takeover on reboot** (unless you disabled it with `action.sh disable` previously). On reboot the module checks the `state/enabled` and `state/in_test` flags to handle power-loss and abnormal-exit residual state.
+6. **Auto-takeover on reboot**, unless you turned it off with `action.sh disable` — that writes `state/disabled` and is honoured across reboots.
+7. **Line endings matter.** Android's sh does not treat CR as whitespace: a CRLF `service.sh` fails on every line (observed: `service.sh[44]: : inaccessible or not found`, the module completely dead), and a CRLF `config.cfg` puts a stray CR into every value. This repo ships `.gitattributes` forcing LF, `customize.sh` normalises at install time, and `config.cfg` is read with CR stripped.
+8. **A silent module is the failure mode to watch for.** The loop logs only on state changes, so a healthy system is quiet. If the log fills with rejection lines, run `action.sh status` and `service.sh --selftest` — they report whether the module actually holds the MCU test-mode lock rather than assuming it does.
 
 ### Files
 
 | File | Purpose |
 |---|---|
 | `module.prop` | Magisk module metadata |
-| `customize.sh` | Set permissions at install |
-| `service.sh` | Main loop: stepped fan control by temperature |
+| `customize.sh` | Set permissions and normalise line endings at install |
+| `service.sh` | Main loop: stepped fan control by temperature (plus `--selftest`) |
 | `stop.sh` | Exit test mode and restore stock policy on uninstall |
-| `action.sh` | Manual enable/disable / status |
+| `action.sh` | Manual enable/disable / status / selftest |
+| `config.cfg` | Thresholds and tier duties |
+| `CHANGELOG.md` | Version history and the v1.3.0 bug-fix notes |
+| `.gitattributes` | Forces LF for scripts and config |
 
 ### Credit
 
@@ -219,20 +248,32 @@ gd32ipdservice: L1:retry_cnt=3 ret=4      ← MCU 拒收
 
 | 皮肤温度 | 档位 | duty | 实测 RPM |
 |---|---|---|---|
-| < 38°C | 安静 | 0% | 0 |
-| 38–47°C | 空闲 | 45% | 7599 |
-| 47–50°C | 温热 | 55% | 8972 |
-| 50–53°C | 较热 | 65% | 10287 |
-| 53–56°C | 很热 | 78% | 11815 |
+| < 41°C | 安静 | 0% | 0 |
+| 41–47°C | 空闲 | 25% | 4346 |
+| 47–50°C | 温热 | 55% | ~9000 |
+| 50–53°C | 较热 | 65% | ~10600 |
+| 53–56°C | 很热 | 78% | 12220 |
 | ≥ 56°C | **交回原厂策略** | 由原厂决定 |
 
-安静档对应厂商在 36°C 左右自动停风扇的行为。没有它，模块会在冷房里空转 45%——纯噪音无制冷。
+PICO A8110 实测 duty → RPM 曲线：
 
-最后一档故意把控制权还给原厂：温度真的过高时，退出测试模式、重启 vendor 服务、恢复原厂降频保护逻辑，比本模块死守一个 duty 安全。要改成固定 90% 也可以，见下方「调整」。
+| duty | 0% | 15% | 20% | 25% | 30% | 35% | 45% | 65% | 78% | 88% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-**滞回**：档位向上跨阈值直接升档，向下则需要皮肤温度跌破 (阈值 - HYSTERESIS) 才降档。默认 HYSTERESIS=400 mC（0.4°C），避免 1°C 抖动让风扇每循环就来回跳档。
+约 3450 RPM 是风扇真正能转起来的最低转速，所以 15% 以下基本等同于停转。
 
-**RPM 上限**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000），下一循环把 duty 提到 `RPM_DUTY`（默认 88%），不看温度。这在皮肤温度尚可但风扇已接近满速、想要更多余量时生效。
+**为什么 T0 是 41°C 而不是 38°C**：PICO 4 息屏静置的皮肤温度实测就在 37.5–40°C。阈值定在 38°C 正好压在待机温度上，而第一档又是 45%（约 7500 RPM），于是出现 0 ↔ 7500 RPM 的反复起跳——一台没人用的设备，风扇每隔几分钟就自己转起来又停下。
+
+安静档对应厂商在 36°C 左右自动停风扇的行为。
+
+最后一档故意把控制权还给原厂：温度真的过高时，退出测试模式、重启 vendor 服务、恢复原厂保护逻辑，比本模块死守一个 duty 安全。控制权要等皮肤落回「较热」档（`OVERHEAT_RELEASE_RANK`，默认 3）才重新接管——交回 5 秒就抢回来等于没交回。
+
+**滞回**：档位向上跨阈值直接升档，向下则需要皮肤温度跌破 `阈值 − HYSTERESIS` 才降档。默认 HYSTERESIS=800 mC（0.8°C）。（v1.2.0 里这段描述只写在文档里，代码除安静档外根本没实现，这个参数实际上不起作用。）
+
+**RPM 上限（带温度闸门）**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000）**且**当前温度档位不低于 `RPM_RELEASE_RANK`（默认 3 = 较热，即皮肤 ≥ 50°C），下一循环才把 duty 提到 `RPM_DUTY`（默认 88%）。
+
+这道温度闸门是安全的关键。没有它，这条规则会永久自锁，而且是那种"读代码时看不出问题"的锁：rpm ≥ 12000 → duty 设为 88%；而在 88% 下风扇上报的 rpm 又 ≥ 12000 → 条件永远成立，同时温度表被完全旁路。唯一的出路是把 duty 降下来，而这又要求 rpm 已经低于阈值——逻辑死锁。实测 duty 88% 时 rpm 真的会到 13671，所以这在日常使用中就能触发，触发后风扇会一直接近满速转下去直到重启。加了闸门之后，皮肤一回到 50°C 以下转速就降下来。
 
 ### 调整
 
@@ -248,14 +289,20 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 默认 `config.cfg`（即出厂值）：
 
 ```
-TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
-HYSTERESIS=400
+TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
 RPM_CAP=12000
 RPM_DUTY=88
+RPM_RELEASE_RANK=3
+OVERHEAT_RELEASE_RANK=3
+RETRY_BACKOFF=3
+FAIL_LOG_EVERY=12
 ```
+
+读取时会先去掉 CR，所以用 Windows 记事本编辑存成 CRLF 也没问题。没写的键回落到内置默认值。
 
 ### 使用方法
 
@@ -270,6 +317,7 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # 恢复�
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # 固定 70%，直到 disable 或 restart
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # 走档：安静->空闲->温热->较热->很热->安静
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # 重载 config.cfg（杀 service.sh 重启）
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # 纯逻辑自检，只读
 ```
 
 开关状态会写入 `state/enabled`，重启后按上次选择恢复。
@@ -283,44 +331,50 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 # duty=55 rpm=8530 rpm_target=9000 mode=duty mode
 ```
 
-### 调整阈值和档位
+### 新增参数（v1.3.0）
 
-编辑 `service.sh` 顶部：
+除档位表之外，`config.cfg` 里还有几个 v1.2.0 没有的开关：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `RPM_RELEASE_RANK` | 3 | 允许 RPM 升速规则生效所需的最低温度档位（`0` 安静 … `4` 很热）。`3` = 只有皮肤 ≥ 50°C 才升速。调大更安静，调小余量更多。 |
+| `OVERHEAT_RELEASE_RANK` | 3 | 过热交回原厂后，皮肤要降回该档才重新接管。 |
+| `RETRY_BACKOFF` | 3 | 风扇写入被拒后，下次重试前等待的秒数。 |
+| `FAIL_LOG_EVERY` | 12 | 日志节流：连续 N 次失败只记 1 条（第 1 次总是记）。 |
+
+想让过热档固定成 90% 而不是交回原厂，把 `main` 循环过热分支里的 `exit_test_mode` 换成 `set_duty 90`，并去掉那里的 `IN_TEST` 相关处理——但这样一来你就失去了原厂自己的高温保护。
+
+### 自检
 
 ```sh
-TIER_IDLE="45"       # < 47°C
-TIER_WARM="55"       # 47-50°C
-TIER_HOT="65"        # 50-53°C
-TIER_VERYHOT="78"    # 53-56°C
-
-T1=47000   # idle -> warm
-T2=50000   # warm -> hot
-T3=53000   # hot -> very hot
-T4=56000   # very hot -> 交回原厂
-LOOP_INTERVAL=5      # 循环间隔（秒）
-STARTUP_GRACE=45     # 开机后等多久再接管
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-想让过热档也固定成 90% 而不是交回原厂，把 `main` 循环里过热分支的 `exit_test_mode` 改成 `set_duty 90`，并去掉 `TIER_OVERHEAT` 相关的退出逻辑。
+把档位阶梯、滞回和 RPM 闸门当作纯逻辑在临时状态目录里跑一遍。不碰风扇、不碰真实温度节点，任何时候都能跑。想确认某份 `config.cfg` 到底会怎么动作，先跑它。`action.sh selftest` 是同一个东西的简写。
 
 ### 注意事项
 
 1. **需要 root**。`gd32ipdclient_test` 走的是 root-only 的 binder 服务，普通 shell 调不动。
 2. **非官方方案**。走的是出厂测试程序 `gd32ipdclient_test`，PICO 没暴露公开接口。理论上固件升级后路径或参数可能变。脚本对工具缺失和温度节点缺失有降级处理，但不会强行锁住风扇——拿不到控制权就退出，让原厂接手。
 3. **vendor 服务始终运行**，不会被杀掉。它的高温保护逻辑在过热档会重新生效。日常温度下你只会更凉快。
-4. **风扇转速上限**：duty=100% 实测 ~12500 RPM。duty 超过 ~85% 噪音明显上升。
+4. **风扇转速上限**：duty 88% 实测 13671 RPM；duty=100% 约 ~12500 RPM。duty 超过 ~85% 噪音明显上升。
 5. **卸载即恢复**。不用手动清理，`stop.sh` 会退出测试模式并重新拉起 vendor 服务。
-6. **重启后自动接管**（除非你之前用 action.sh disable 关过）。模块重启时会先检查 `state/enabled` 和 `state/in_test` 标志，处理掉掉电、异常退出的残留状态。
+6. **重启后自动接管**，除非你用 `action.sh disable` 关过——那条命令会写 `state/disabled`，重启也会保持关闭。
+7. **行尾符会出事**。Android 的 sh 不把 CR 当空白字符：CRLF 的 `service.sh` 每一行都会失败（实测报 `service.sh[44]: : inaccessible or not found`，模块彻底失灵），CRLF 的 `config.cfg` 会把回车带进每个值里。仓库用 `.gitattributes` 强制 LF，`customize.sh` 在安装时再归一化一次，`config.cfg` 读取时也会去掉 CR。
+8. **模块"安静"才是正常**。控制循环只在状态变化时记日志，所以日志少是好事。如果日志被失败信息刷满，跑 `action.sh status` 和 `service.sh --selftest`——它们会告诉你模块到底有没有真正握住 MCU 的测试模式，而不是假设它握着。
 
 ### 文件清单
 
 | 文件 | 作用 |
 |---|---|
 | `module.prop` | Magisk 模块元信息 |
-| `customize.sh` | 安装时设置权限 |
-| `service.sh` | 主循环：按温度分档控风扇 |
+| `customize.sh` | 安装时设置权限并归一化行尾符 |
+| `service.sh` | 主循环：按温度分档控风扇（含 `--selftest`） |
 | `stop.sh` | 卸载时退出测试模式、恢复原厂策略 |
-| `action.sh` | 手动开关 / 状态查询 |
+| `action.sh` | 手动开关 / 状态查询 / 自检 |
+| `config.cfg` | 阈值与各档 duty |
+| `CHANGELOG.md` | 版本历史与 v1.3.0 修复说明 |
+| `.gitattributes` | 强制脚本与配置使用 LF |
 
 ### 致谢
 
@@ -378,20 +432,32 @@ Duty, записанный через `setfantestspeed`, не затрагива
 
 | Т-ра кожи | ступень | duty | Измеренные RPM |
 |---|---|---|---|
-| < 38°C | тихий | 0% | 0 |
-| 38–47°C | свободный | 45% | 7599 |
-| 47–50°C | тёплый | 55% | 8972 |
-| 50–53°C | горячий | 65% | 10287 |
-| 53–56°C | очень горячий | 78% | 11815 |
+| < 41°C | тихий | 0% | 0 |
+| 41–47°C | свободный | 25% | 4346 |
+| 47–50°C | тёплый | 55% | ~9000 |
+| 50–53°C | горячий | 65% | ~10600 |
+| 53–56°C | очень горячий | 78% | 12220 |
 | ≥ 56°C | **возврат заводской политики** | решает vendor |
 
-Тихая ступень соответствует заводскому поведению около 36°C (вентилятор выключается). Без неё модуль бы крутил 45% в холодной комнате — только шум, пользы ноль.
+Измеренная кривая duty → RPM на PICO A8110:
 
-Последняя ступень намеренно возвращает управление заводской прошивке: когда становится по-настоящему жарко, выход из тестового режима, перезапуск vendor-сервиса и восстановление заводской логики термозащиты безопаснее, чем удержание фиксированного duty этим модулем. Можно изменить на фиксированные 90% — см. «Настройка» ниже.
+| duty | 0% | 15% | 20% | 25% | 30% | 35% | 45% | 65% | 78% | 88% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-**Истерезис**: ступень растёт при переходе порога, а падает только после падения ниже (порог - ИСТЕРЕЗИС). По умолчанию ИСТЕРЕЗИС=400 мС (0.4°C). Температурная дрожь в 1°C не вызывает дребезг вентилятора каждую итерацию.
+Примерно 3450 RPM — минимальные обороты, на которых вентилятор вообще вращается, поэтому duty ниже ~15% практически равен выключенному.
 
-**Ограничение по RPM**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%), независимо от температуры. Это ловит случай, когда кожа в норме, а вентилятор уже почти на максимуме и нужен запас.
+**Почему T0 = 41°C, а не 38°C.** У PICO 4, лежащего с выключенным экраном, температура кожи составляет 37.5–40°C. Порог 38°C попадает ровно на эту температуру простоя, а первая ступень — 45% (~7500 RPM), что давало мигание 0 ↔ 7500 RPM: вентилятор на неиспользуемом шлеме сам запускался и останавливался каждые несколько минут.
+
+Тихая ступень соответствует заводскому поведению около 36°C (вентилятор выключается).
+
+Последняя ступень намеренно возвращает управление заводской прошивке: когда становится по-настоящему жарко, выход из тестового режима, перезапуск vendor-сервиса и восстановление заводской логики термозащиты безопаснее, чем удержание фиксированного duty этим модулем. Управление возвращается только когда кожа опускается до ступени `HOT` (`OVERHEAT_RELEASE_RANK`, по умолчанию 3) — отдать управление и через пять секунд забрать его обратно лишает смысла всю защиту.
+
+**Истерезис**: ступень растёт сразу при переходе порога, а падает только после падения ниже `порог − ИСТЕРЕЗИС` (по умолчанию 800 мС = 0.8°C). (В v1.2.0 это было описано в документации, но в коде, кроме тихой ступени, не реализовано — параметр ни на что не влиял.)
+
+**Ограничение по RPM, с температурным шлюзом**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000) **и** текущая температурная ступень не ниже `RPM_RELEASE_RANK` (по умолчанию 3 = горячий, т.е. кожа ≥ 50°C), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%).
+
+Именно температурный шлюз делает это правило безопасным. Без него правило залипает навсегда, причём так, что при чтении кода это незаметно: rpm ≥ 12000 задаёт duty 88%; при duty 88% вентилятор снова сообщает ≥ 12000 rpm; условие остаётся истинным вечно, а температурная таблица полностью игнорируется. Единственный выход — снизить duty, но для этого rpm уже должен быть ниже порога. Измеренный rpm действительно достигает 13671 при duty 88%, то есть это достижимо в обычной работе, и вентилятор крутился бы почти на максимуме в простое до перезагрузки. Со шлюзом обороты падают, как только кожа возвращается ниже 50°C.
 
 ### Настройка
 
@@ -407,14 +473,20 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 Пример `config.cfg` (установленные по умолчанию значения):
 
 ```
-TIER_QUIET=0       TIER_IDLE=45   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=38000  T1=47000  T2=50000  T3=53000  T4=56000
-HYSTERESIS=400
+TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
+T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
 RPM_CAP=12000
 RPM_DUTY=88
+RPM_RELEASE_RANK=3
+OVERHEAT_RELEASE_RANK=3
+RETRY_BACKOFF=3
+FAIL_LOG_EVERY=12
 ```
+
+Файл читается с удалением CR, поэтому сохранять его редактором Windows (Notepad и т.п.), который пишет CRLF, безопасно. Пропущенные ключи берут встроенные значения по умолчанию.
 
 ### Использование
 
@@ -429,24 +501,10 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # вер�
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # зафиксировать duty=70% до disable или restart
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->тихий
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # перечитать config.cfg (перезапуск service.sh)
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # проверка чистой логики, только чтение
 ```
 
-### Использование
-
-После установки модуль автоматически перехватывает вентилятор при загрузке.
-
-Ручное управление (кнопка «Action」в Magisk Manager или из shell):
-
-```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # duty/об/мин/т-ра/ступень + таблица
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # service.sh управляет вентилятором по температуре
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # вернуть заводскую политику
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # зафиксировать duty=70% до disable или restart
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->тихий
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # перечитать config.cfg (перезапуск service.sh)
-```
-
-Состояние переключателя записывается в `state/enabled` && переживает перезагрузку.
+Состояние переключателя переживает перезагрузку (v1.3.0): `state/enabled` означает «модуль управляет вентилятором», `state/disabled` — «пользователь выключил модуль». После `disable` модуль не перехватит управление снова при загрузке. `disable` также возвращает вентилятор vendor, а работающий цикл управления завершается сам.
 
 Для возврата к заводскому поведению: отключите или удалите модуль. `stop.sh` выйдет из тестового режима, перезапустит vendor-сервис и вернёт вентилятор заводскому управлению.
 
@@ -457,44 +515,50 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 # duty=55 rpm=8530 rpm_target=9000 mode=duty mode
 ```
 
-### Настройка
+### Дополнительные ключи (v1.3.0)
 
-Редактируйте начало `service.sh`:
+Помимо таблицы ступеней, в `config.cfg` есть ключи, которых не было в v1.2.0:
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `RPM_RELEASE_RANK` | 3 | Температурная ступень (`0` тихий … `4` очень горячий), начиная с которой правилу RPM разрешено поднимать duty. `3` = только при коже ≥ 50°C. Больше — тише, меньше — больше запаса. |
+| `OVERHEAT_RELEASE_RANK` | 3 | Ступень, до которой должна остыть кожа, прежде чем модуль снова возьмёт управление после возврата vendor при перегреве. |
+| `RETRY_BACKOFF` | 3 | Пауза в секундах после отклонённой записи duty перед следующей попыткой. |
+| `FAIL_LOG_EVERY` | 12 | Ограничение логов: из N подряд неудачных записей логируется только одна (первая — всегда). |
+
+Чтобы последняя ступень держала фиксированные 90% вместо возврата vendor, замените `exit_test_mode` на `set_duty 90` в ветке перегрева главного цикла и уберите там работу с `IN_TEST` — но тогда вы теряете заводскую термозащиту.
+
+### Самотест
 
 ```sh
-TIER_IDLE="45"       # < 47°C
-TIER_WARM="55"       # 47-50°C
-TIER_HOT="65"        # 50-53°C
-TIER_VERYHOT="78"    # 53-56°C
-
-T1=47000   # idle -> warm
-T2=50000   # warm -> hot
-T3=53000   # hot -> very hot
-T4=56000   # very hot -> возврат vendor
-LOOP_INTERVAL=5      # интервал цикла (секунды)
-STARTUP_GRACE=45     # сколько ждать после загрузки
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-Чтобы последняя ступень держала фиксированные 90% вместо возврата vendor, замените `exit_test_mode` на `set_duty 90` в ветке перегрева главного цикла и удалите логику выхода `TIER_OVERHEAT`.
+Прогоняет лестницу ступеней, истерезис и RPM-шлюз как чистую логику во временном каталоге состояния. Вентилятора и реального узла температуры не касается, поэтому запускать можно в любой момент. Удобно, чтобы заранее увидеть, как поведёт себя конкретный `config.cfg`. `action.sh selftest` — то же самое.
 
 ### Примечания
 
 1. **Требуется root.** `gd32ipdclient_test` общается с root-only binder-сервисом; обычный shell его не двигает.
 2. **Неофициальный метод.** Используется заводская тестовая программа `gd32ipdclient_test`; публичного интерфейса нет. Обновления прошивки могут изменить пути или параметры. Скрипты gracefully деградируют при отсутствии инструмента или узла температуры, но не принудительно блокируют вентилятор — при невозможности получить управление они выходят и отдают контроль vendor.
 3. **Vendor-сервис всегда работает.** Он никогда не убивается. Его логика защиты от перегрева активируется снова на последней ступени. При обычных температурах вы просто будете холоднее.
-4. **Потолок оборотов:** duty=100% даёт ~12500 RPM. Шум заметно растёт выше duty ~85%.
-5. **Удаление возвращает заводское.** Ручная очистка не нужна; `stop.sh` выходит из тестового режима и перезапускаet vendor-сервис.
-6. **Автоперехват при перезагрузке** (если вы не отключали через `action.sh disable` раньше). При перезагрузке модуль проверяет флаги `state/enabled` и `state/in_test`, чтобы обработать остаточное состояние после сбоя питания или аномального завершения.
+4. **Потолок оборотов:** при duty 88% измерено 13671 RPM; duty=100% даёт ~12500 RPM. Шум заметно растёт выше duty ~85%.
+5. **Удаление возвращает заводское.** Ручная очистка не нужна; `stop.sh` выходит из тестового режима и перезапускает vendor-сервис.
+6. **Автоперехват при перезагрузке**, если вы не отключали модуль через `action.sh disable` — эта команда пишет `state/disabled`, и флаг сохраняется между перезагрузками.
+7. **Переводы строк важны.** Android sh не считает CR пробельным символом: `service.sh` с CRLF падает на каждой строке (наблюдалось `service.sh[44]: : inaccessible or not found`, модуль полностью мёртв), а `config.cfg` с CRLF добавляет лишний CR в каждое значение. В репозитории есть `.gitattributes` с принудительным LF, `customize.sh` нормализует при установке, а `config.cfg` читается с удалением CR.
+8. **Главный признак проблемы — молчание модуля.** Цикл пишет в лог только при смене состояния, поэтому здоровая система тихая. Если лог заполняется строками об отказах, выполните `action.sh status` и `service.sh --selftest`: они показывают, действительно ли модуль удерживает тестовый режим MCU, а не предполагают это.
 
 ### Файлы
 
 | Файл | Назначение |
 |---|---|
 | `module.prop` | Метаданные Magisk-модуля |
-| `customize.sh` | Установка прав при установке |
-| `service.sh` | Главный цикл: ступенчатое управление по температуре |
+| `customize.sh` | Установка прав и нормализация переводов строк при установке |
+| `service.sh` | Главный цикл: ступенчатое управление по температуре (плюс `--selftest`) |
 | `stop.sh` | Выход из тестового режима и возврат заводской политики при удалении |
-| `action.sh` | Ручное включение/выключение / статус |
+| `action.sh` | Ручное включение/выключение / статус / самотест |
+| `config.cfg` | Пороги и значения duty по ступеням |
+| `CHANGELOG.md` | История версий и список исправлений v1.3.0 |
+| `.gitattributes` | Принудительный LF для скриптов и конфигурации |
 
 ### Благодарности
 

@@ -1,0 +1,13 @@
+# Android 的 sh（mksh/toybox ash）不把 CR 当空白字符。
+# 如果 service.sh / action.sh / config.cfg 变成 CRLF，行为是致命的：
+#   tier=$(pick_tier)            -> tier 变成 "IDLE\r"
+#   case "$tier" in IDLE) ...    -> 匹配不上，整个控制逻辑静默失效
+#   TIER_IDLE=25                 -> 值变成 "25\r"，写进 state 和日志
+# 实测：CRLF 的 service.sh 在设备上每一行赋值都报 "inaccessible or not found"。
+#
+# Windows 上 git 默认 core.autocrlf=true 检出的就是 CRLF，所以这里强制 LF。
+* text=auto
+*.sh   text eol=lf
+*.cfg  text eol=lf
+*.prop text eol=lf
+*.md   text eol=lf
