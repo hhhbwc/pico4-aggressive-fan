@@ -33,6 +33,9 @@ IN_TEST="$STATE_DIR/in_test"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
 PINNED="$STATE_DIR/pinned"
+LAST_OK="$STATE_DIR/last_ok"
+GAVE_UP="$STATE_DIR/gave_up"
+PID_FILE="$STATE_DIR/service.pid"
 TOOL="/system/bin/gd32ipdclient_test"
 TEMP_NODE="/sys/class/thermal/thermal_zone86/temp"
 SVC="$MODDIR/service.sh"
@@ -45,7 +48,15 @@ T0=41000; T1=47000; T2=50000; T3=53000; T4=56000
 HYSTERESIS=800
 RPM_CAP=12000; RPM_DUTY=88; RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
-if [ -r "$CONFIG_FILE" ]; then
+MAX_FAIL_STREAK=10
+
+# 优先用 service.sh --dumpcfg 的输出：那是**校验后**的生效值。
+# 直接 source config.cfg 会出现"配置写错了，但 status 显示的还是错的值"，
+# 排查时被误导。拿不到就退回老办法（去 CR 后 source）。
+if [ -r "$SVC" ] && sh "$SVC" --dumpcfg > "$STATE_DIR/config.effective" 2>/dev/null; then
+    . "$STATE_DIR/config.effective" 2>/dev/null
+    rm -f "$STATE_DIR/config.effective" 2>/dev/null
+elif [ -r "$CONFIG_FILE" ]; then
     # 与 service.sh 一致：先去掉 CR，避免 CRLF 配置里的回车跑进状态表和 duty 值。
     CFG_NORM="$STATE_DIR/config.norm"
     if command -v tr >/dev/null 2>&1 \
@@ -76,15 +87,42 @@ is_disabled() {
     [ -f "$DISABLED" ]
 }
 
+# 只认 pid 文件里记的那个进程，不再靠 pgrep -f 猜。
+# pgrep/pkill 在部分精简环境不存在，或匹配串过宽会误判/误杀。
+svc_pid() {
+    _p=""
+    [ -r "$PID_FILE" ] && read -r _p < "$PID_FILE" 2>/dev/null
+    [ -n "$_p" ] || return 1
+    kill -0 "$_p" 2>/dev/null || return 1
+    if [ -r "/proc/$_p/cmdline" ]; then
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q "service.sh" || return 1
+    fi
+    echo "$_p"
+    return 0
+}
+
 service_running() {
-    pgrep -f "$SVC" >/dev/null 2>&1
+    svc_pid >/dev/null 2>&1
+}
+
+# 杀掉 service.sh：优先 pid 文件，pgrep/pkill 只作兜底且用完整路径匹配。
+kill_service() {
+    _p=$(svc_pid 2>/dev/null)
+    [ -n "$_p" ] && kill -TERM "$_p" 2>/dev/null
+    pkill -f "$SVC" 2>/dev/null
+    sleep 2
+    _p=$(svc_pid 2>/dev/null)
+    [ -n "$_p" ] && kill -9 "$_p" 2>/dev/null
+    pkill -9 -f "$SVC" 2>/dev/null
+    rm -f "$PID_FILE" 2>/dev/null
+    return 0
 }
 
 # enable/on/set/cycle 之后，如果 service.sh 已经因为 disabled 退出，重新拉起它。
 ensure_service() {
-    service_running && return 0
+    if service_running; then return 0; fi
     nohup sh "$SVC" >/dev/null 2>&1 &
-    sleep 1
+    sleep 2
     service_running && echo "已重新拉起 service.sh"
     return 0
 }
@@ -128,7 +166,7 @@ pin_duty() {
         *) echo "固定失败"; return 1 ;;
     esac
     # Kill service.sh so it does not re-evaluate and override the pin.
-    pkill -f "$(basename "$SVC")" 2>/dev/null
+    kill_service
     return 0
 }
 
@@ -176,7 +214,10 @@ cycle_step() {
     case "$out" in
         *success*) echo "已切到 $next 档 (duty=$d%)"
                    rm -f "$DISABLED"
-                   pkill -f "$(basename "$SVC")" 2>/dev/null
+                   # 必须同时清掉 pinned：否则 set 之后再 cycle，status 会一直
+                   # 显示"手动固定 (duty=50%)"，与刚切到的档位不符。
+                   rm -f "$PINNED"
+                   kill_service
                    return 0 ;;
         *) echo "切档失败"; return 1 ;;
     esac
@@ -193,11 +234,15 @@ tier_table() {
     printf "  回滞 HYSTERESIS=%s mC (%sC) | RPM 升速闸门档位=%s | 过热重新接管档位=%s\n" \
         "$HYSTERESIS" "$(awk "BEGIN{printf \"%.1f\", $HYSTERESIS/1000}")" \
         "$RPM_RELEASE_RANK" "$OVERHEAT_RELEASE_RANK"
+    printf "  RPM 闸门: rpm>=%s 时升到 duty=%s%% | 连续失败 %s 次后放弃并交还原厂\n" \
+        "$RPM_CAP" "$RPM_DUTY" "$MAX_FAIL_STREAK"
 }
 
 status() {
     echo "== 风扇温控状态 =="
-    if is_disabled; then
+    if [ -f "$GAVE_UP" ]; then
+        echo "模式: 已放弃控制 (写入持续被拒，已交还原厂) — action.sh restart 可重试"
+    elif is_disabled; then
         echo "模式: 已关闭 (持久，重启保持) — vendor 控制，action.sh enable 可恢复"
     elif is_pinned; then
         if in_test_mode; then
@@ -222,8 +267,7 @@ status() {
     d=$(echo "$info" | sed -n 's/^duty=\([0-9][0-9]*\).*/\1/p' | head -n 1)
     r=$(echo "$info" | sed -n 's/^rpm=\([0-9][0-9]*\).*/\1/p' | head -n 1)
     v=$(getprop init.svc.pxrfanservice 2>/dev/null)
-    svc=$(pidof "$(basename "$SVC")" 2>/dev/null || true)
-    [ -z "$svc" ] && svc=$(pgrep -f "$(basename "$SVC")" 2>/dev/null || true)
+    svc=$(svc_pid 2>/dev/null || true)
     cur_tier=$(cat "$CUR_TIER" 2>/dev/null || echo "(none)")
     cur_duty=$(cat "$CUR_DUTY" 2>/dev/null || echo "(none)")
 
@@ -231,6 +275,17 @@ status() {
     printf "皮肤温度 %s°C | 风扇 duty=%s%% rpm=%s\n" "$t_c" "${d:-?}" "${r:-?}"
     printf "vendor=%s | 当前档=%s (上次写入 duty=%s)\n" "${v:-?}" "$cur_tier" "$cur_duty"
     [ -n "$svc" ] && printf "service.sh PID=%s\n" "$svc"
+    # 最后一次成功写入风扇的时间。模块"看起来在跑"但这个值一直不更新，
+    # 就说明它其实没有控制权 —— 这是排查静默失灵最有用的一行。
+    if [ -r "$LAST_OK" ]; then
+        _lo=$(cat "$LAST_OK" 2>/dev/null)
+        _now=$(date +%s 2>/dev/null)
+        if [ -n "$_lo" ] && [ -n "$_now" ]; then
+            printf "上次成功写风扇: %s 秒前\n" "$((_now - _lo))"
+        fi
+    else
+        echo "上次成功写风扇: 从未（本轮还没成功写入过）"
+    fi
     printf "标记: %s\n" "$(ls "$STATE_DIR" 2>/dev/null | tr '\n' ' ')"
 
     echo ""
@@ -238,11 +293,11 @@ status() {
 }
 
 restart_service() {
-    pkill -f "$(basename "$SVC")" 2>/dev/null
-    sleep 2
+    kill_service
+    rm -f "$GAVE_UP" 2>/dev/null
     nohup sh "$SVC" >/dev/null 2>&1 &
     sleep 3
-    new=$(pgrep -f "$(basename "$SVC")" 2>/dev/null || true)
+    new=$(svc_pid 2>/dev/null)
     if [ -n "$new" ]; then
         echo "已重启 service.sh (PID=$new)，已加载最新 config.cfg"
         return 0
@@ -261,7 +316,7 @@ case "$CMD" in
         fi
         if take_over; then
             : > "$ENABLED"
-            rm -f "$DISABLED"
+            rm -f "$DISABLED" "$GAVE_UP"
             echo "已开启本模块温控 (持久)"
             ensure_service
         else
@@ -307,7 +362,7 @@ case "$CMD" in
         # 'auto' means: follow whatever the flag says, which is what boot does.
         # 'on'  = take over, 'off' = hand back. Kept short for convenience.
         if [ "$CMD" = "on" ]; then
-            take_over && : > "$ENABLED" && rm -f "$DISABLED" || exit 1
+            take_over && : > "$ENABLED" && rm -f "$DISABLED" "$GAVE_UP" || exit 1
             echo "已开启本模块温控 (持久)"
             ensure_service
         elif [ "$CMD" = "off" ]; then

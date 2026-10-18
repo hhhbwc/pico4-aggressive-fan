@@ -6,7 +6,7 @@
 
 A Magisk module that replaces PICO 4's stock fan curve with a skin-temperature stepped curve, one tier higher. Uses GD32 MCU test mode to bypass the stock 35% duty lock — the vendor service (`pxrfanservice`) stays running untouched.
 
-> **v1.3.0** fixes several defects that made the module silently lose control of the fan — a stale test-mode flag, an RPM escalation rule that never released, hysteresis that was documented but never implemented, a non-persistent `disable`, and CRLF line endings breaking the scripts outright. Details and measured evidence: [CHANGELOG.md](CHANGELOG.md).
+> **v1.5.0** is the current release. It builds on the v1.3.0 / v1.4.0 fixes (stale test-mode flag, RPM escalation deadlock, hysteresis, persistent `disable`, CRLF-safety, timeout watchdog, config validation) and adds real-device hardening: `config.cfg` is now parsed through a whitelist instead of being `source`d (closes a variable-override + root-RCE hole), and the watchdog no longer relies on toybox `timeout` (which cannot kill script-type MCU tools, freezing the fan). Details and measured evidence: [CHANGELOG.md](CHANGELOG.md).
 >
 > If you are upgrading from v1.2.0, re-check `config.cfg`: the shipped `T0` (38000 → 41000) and `TIER_IDLE` (45 → 25) changed, and four new keys were added. Your existing file is read as-is, so delete it to pick up the new defaults.
 
@@ -157,8 +157,32 @@ Beyond the tier table, `config.cfg` carries a few knobs that did not exist in v1
 | `OVERHEAT_RELEASE_RANK` | 3 | Temperature tier the skin must fall back to before the module retakes control after an overheat handback. |
 | `RETRY_BACKOFF` | 3 | Seconds to wait after a rejected fan write before trying again. |
 | `FAIL_LOG_EVERY` | 12 | Log throttling — only 1 in N consecutive write failures is logged (the first one is always logged). |
+| `MAX_FAIL_STREAK` | 10 | **v1.4.0.** Give up after N consecutive rejected fan writes: exit MCU test mode, hand back to the vendor and write `state/gave_up`. Without this cap a permanently failing tool means the MCU stays stuck in test mode — the vendor's duty frames are rejected too, so *nobody* controls the fan, while the state files still claim the module is in charge. |
 
 To make the overheat tier hold a fixed 90% instead of handing back to the vendor, replace `exit_test_mode` with `set_duty 90` in the `main` loop's overheat branch and drop the `IN_TEST` bookkeeping there — but you then lose the vendor's own high-temperature protection.
+
+### Config validation
+
+`config.cfg` is read through a **whitelist** (v1.5.0): each `KEY=VALUE` line is parsed, only
+the known numeric keys are accepted, and any value containing command substitution (`$( )`,
+backticks), `;` or `&` is rejected. This closes the old `source`-based hole where a malicious
+or careless edit could override internal variables (`TOOL`, `STATE_DIR`, `TEMP_NODE`, …) or
+run arbitrary commands as root. After loading, the accepted values are still sanitised: tier
+duties are clamped to 0-100, `T0..T4` must be strictly increasing, `HYSTERESIS` is capped at
+(smallest adjacent gap − 1), and `LOOP_INTERVAL` / `RETRY_BACKOFF` / `FAIL_LOG_EVERY` have a
+lower bound of 1.
+
+That lower bound matters: `sleep` returns immediately on a non-numeric or empty argument, so
+`LOOP_INTERVAL=abc` turns the control loop into a zero-delay busy loop (binder call storm plus a
+core pinned at 100%). `FAIL_LOG_EVERY=0` is a division by zero that silently disables failure
+logging entirely.
+
+Anything invalid is logged and falls back to the default. To see the values that actually took
+effect:
+
+```sh
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
+```
 
 ### Self-test
 
@@ -174,10 +198,12 @@ Runs the tier ladder, hysteresis and RPM gate as pure logic against a scratch st
 2. **Unofficial method.** Uses PICO's factory test program; no public interface is exposed. Firmware updates may change the paths or parameters. The scripts degrade gracefully if the tool or the temp node is missing, but they will not force-lock the fan — if they cannot get control, they exit and let the vendor take over.
 3. **Vendor service always runs.** It is never killed. Its high-temp protection logic re-activates at the overheat tier. Under normal temperatures you will just be cooler.
 4. **Fan speed ceiling:** duty 88% measures 13671 RPM; duty 100% is around 12500 on some units. Noise rises noticeably above duty ~85%.
-5. **Uninstall restores stock.** No manual cleanup needed; `stop.sh` exits test mode and restarts the vendor service.
+5. **Uninstall restores stock.** No manual cleanup needed; `stop.sh` exits test mode **and kills the running `service.sh` loop** (v1.4.0 — killing it matters: a surviving loop notices the missing `in_test` flag and immediately retakes test mode, which is why an uninstalled module could leave the fan stuck at one speed until reboot), then restarts the vendor service.
 6. **Auto-takeover on reboot**, unless you turned it off with `action.sh disable` — that writes `state/disabled` and is honoured across reboots.
 7. **Line endings matter.** Android's sh does not treat CR as whitespace: a CRLF `service.sh` fails on every line (observed: `service.sh[44]: : inaccessible or not found`, the module completely dead), and a CRLF `config.cfg` puts a stray CR into every value. This repo ships `.gitattributes` forcing LF, `customize.sh` normalises at install time, and `config.cfg` is read with CR stripped.
 8. **A silent module is the failure mode to watch for.** The loop logs only on state changes, so a healthy system is quiet. If the log fills with rejection lines, run `action.sh status` and `service.sh --selftest` — they report whether the module actually holds the MCU test-mode lock rather than assuming it does.
+9. **`status` prints "last successful fan write: N seconds ago"** (v1.4.0). This is the single most useful line when something looks wrong: a module that is running but has not written successfully for minutes has no real control, no matter what the other state files say.
+10. **Only one `service.sh` runs at a time** (v1.4.0). It records its pid in `state/service.pid` and refuses to start when that process is still alive — `pgrep`/`pkill` alone are not reliable enough, and two loops fighting over the duty is a real failure mode.
 
 ### Files
 
@@ -341,8 +367,25 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 | `OVERHEAT_RELEASE_RANK` | 3 | 过热交回原厂后，皮肤要降回该档才重新接管。 |
 | `RETRY_BACKOFF` | 3 | 风扇写入被拒后，下次重试前等待的秒数。 |
 | `FAIL_LOG_EVERY` | 12 | 日志节流：连续 N 次失败只记 1 条（第 1 次总是记）。 |
+| `MAX_FAIL_STREAK` | 10 | **v1.4.0。** 连续 N 次写入被拒后放弃控制：退出 test mode、交还原厂、写 `state/gave_up`。没有这个上限时，工具一旦持续失败，MCU 会一直卡在 test mode，原厂的 duty 帧同样被拒，**风扇没人管**，而 state 文件还写着"本模块温控"。 |
 
 想让过热档固定成 90% 而不是交回原厂，把 `main` 循环过热分支里的 `exit_test_mode` 换成 `set_duty 90`，并去掉那里的 `IN_TEST` 相关处理——但这样一来你就失去了原厂自己的高温保护。
+
+### 配置校验（v1.4.0）
+
+`config.cfg` 从 v1.5.0 起改为**白名单逐行解析**：每行按 `KEY=VALUE` 拆，只接受已知的数值键，
+且拒绝一切含命令替换（`$( )`、反引号）、`;` 或 `&` 的值。这堵上了原先 `source` 带来的口子——
+恶意或手滑的配置能覆盖内部变量（`TOOL` / `STATE_DIR` / `TEMP_NODE` 等）或在 root 下执行任意命令。
+解析后仍需过校验：档位 duty 夹紧到 0-100；`T0..T4` 必须严格递增；`HYSTERESIS` 上限为相邻档位
+最小间隔 - 1；`LOOP_INTERVAL` / `RETRY_BACKOFF` / `FAIL_LOG_EVERY` 下限为 1。
+
+下限这条很关键：`sleep` 遇到非数字或空值会**立即返回**，所以 `LOOP_INTERVAL=abc` 会让主
+循环变成零延迟忙循环（binder 调用风暴 + 打满一个核）；`FAIL_LOG_EVERY=0` 则是取模除零，
+失败日志会彻底消失。非法值会记日志并回落默认值。查看最终生效值：
+
+```sh
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
+```
 
 ### 自检
 
@@ -358,10 +401,12 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 2. **非官方方案**。走的是出厂测试程序 `gd32ipdclient_test`，PICO 没暴露公开接口。理论上固件升级后路径或参数可能变。脚本对工具缺失和温度节点缺失有降级处理，但不会强行锁住风扇——拿不到控制权就退出，让原厂接手。
 3. **vendor 服务始终运行**，不会被杀掉。它的高温保护逻辑在过热档会重新生效。日常温度下你只会更凉快。
 4. **风扇转速上限**：duty 88% 实测 13671 RPM；duty=100% 约 ~12500 RPM。duty 超过 ~85% 噪音明显上升。
-5. **卸载即恢复**。不用手动清理，`stop.sh` 会退出测试模式并重新拉起 vendor 服务。
+5. **卸载即恢复**。不用手动清理，`stop.sh` 会退出测试模式、**杀掉还在跑的 `service.sh` 循环**（v1.4.0：这一步是关键，活着的循环发现 `in_test` 没了会立刻重新抢回 test mode，这正是"模块卸了风扇却停在某个转速、只能重启"的原因），再重新拉起 vendor 服务。
 6. **重启后自动接管**，除非你用 `action.sh disable` 关过——那条命令会写 `state/disabled`，重启也会保持关闭。
 7. **行尾符会出事**。Android 的 sh 不把 CR 当空白字符：CRLF 的 `service.sh` 每一行都会失败（实测报 `service.sh[44]: : inaccessible or not found`，模块彻底失灵），CRLF 的 `config.cfg` 会把回车带进每个值里。仓库用 `.gitattributes` 强制 LF，`customize.sh` 在安装时再归一化一次，`config.cfg` 读取时也会去掉 CR。
 8. **模块"安静"才是正常**。控制循环只在状态变化时记日志，所以日志少是好事。如果日志被失败信息刷满，跑 `action.sh status` 和 `service.sh --selftest`——它们会告诉你模块到底有没有真正握住 MCU 的测试模式，而不是假设它握着。
+9. **`status` 会打印"上次成功写风扇: N 秒前"**（v1.4.0）。排查时最有用的一行：一个在跑但几分钟没成功写过的模块，其余 state 文件再好看也没有真正的控制权。
+10. **同一时刻只会有一个 `service.sh`**（v1.4.0）。它把 pid 写进 `state/service.pid`，发现上一个还活着就自己退出——单靠 `pgrep`/`pkill` 不够可靠，两个循环抢写 duty 是真实的故障模式。
 
 ### 文件清单
 

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# PICO 4 Fan Auto Temp Control — v1.3.0
+# PICO 4 Fan Auto Temp Control — v1.5.0
 #
 # 本版本修掉一批会让模块静默失灵的缺陷，设计意图（皮肤温度分档 + 绕过原厂锁）
 # 与档位机制保持不变。逐条说明见下面的注释和 CHANGELOG.md。
@@ -39,8 +39,22 @@
 #       现在：config.cfg 加载前先 tr -d '\r'（兼容记事本存出来的 CRLF）；
 #       仓库用 .gitattributes 强制 LF；customize.sh 在安装时再做一次归一化。
 #
-# 其它：binder 工具调用统一套 timeout，避免对端卡死把整个循环挂住（原版没有
-# 看门狗，卡住后风扇会停在最后一次写入的转速）；state/last_run.log 死变量清掉。
+# [7] config.cfg 盲目 source 导致变量覆盖 + 任意代码执行（root RCE）。
+#     /system/bin/sh 下直接 source 用户可编辑文件，非白名单键（TOOL / STATE_DIR /
+#     MODDIR / TEMP_NODE / LOG_TAG）能被覆盖，例如 TOOL=/system/bin/false 让模块
+#     永久失效；值里的 $(...) / 反引号在 source 时执行，等于 root 下任意命令执行。
+#     现在改为白名单逐行解析：先去 CR，只接受 19 个已知数值键，拒绝一切非白名单
+#     键与含命令替换（$( )、`、`;`、`&`）的值。实机注入测试：TOOL 覆盖被忽略、
+#     PWNED=$(touch ...) 与 TIER_QUIET=$(touch ...) 都未触发。
+#
+# [8] 看门狗在实机上对脚本型 MCU 工具失效。v1.4.0 用 `$(timeout 5 "$TOOL" ...)`，
+#     实机测出 toybox timeout 杀"内含 sleep 60 的脚本"要等满 60s（信号传不到二次
+#     exec 的子进程），看门狗退化、风扇冻结在最后转速。同时 `$( )` 管道捕获会因
+#     孤儿子进程持有写端而永久阻塞。现在不再用 timeout 二进制：后台跑+轮询 kill -0
+#     + 超时 kill -9 整个进程组，输出重定向到临时文件事后 cat。实测脚本型工具卡死
+#     被稳定掐在 5s。
+#
+# 其它：state/last_run.log 死变量清掉。
 #
 # 用法补充
 # ---------------------------------------------------------------------------
@@ -65,6 +79,9 @@ DISABLED="$STATE_DIR/disabled"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
 IN_TEST="$STATE_DIR/in_test"
+LAST_OK="$STATE_DIR/last_ok"
+GAVE_UP="$STATE_DIR/gave_up"
+PID_FILE="$STATE_DIR/service.pid"
 
 TOOL="/system/bin/gd32ipdclient_test"
 
@@ -114,29 +131,130 @@ RETRY_BACKOFF=3
 # 失败日志节流：每 N 次失败记一条（第 1 次总是记）。防止刷爆 logcat。
 FAIL_LOG_EVERY=12
 
+# 连续写入失败达到该次数后，放弃控制、退出 test mode 交还原厂。
+# 没有这个上限时，工具一旦持续拒绝（固件变更 / 权限丢失 / MCU 异常），
+# 模块会无限重试、state 里却始终显示"正在控温"，风扇实际没人管。
+MAX_FAIL_STREAK=10
+
 # ---------------------------------------------------------------------------
 # Load config.cfg if present. Each line is KEY=VALUE, '#' starts a comment.
 # ---------------------------------------------------------------------------
 
+# 仅从白名单读取 config.cfg。config.cfg 是用户可编辑文件，直接 source 会带来
+# 两个致命问题：(1) 任意键都能覆盖脚本内部关键变量（TOOL / STATE_DIR / MODDIR /
+# TEMP_NODE / LOG_TAG），例如写入 TOOL=/system/bin/false 让模块永久失效；
+# (2) 值里的 $(...) 或反引号会在 source 时被执行（root 下即任意代码执行）。
+# 所以这里逐行解析：先去 CR，只接受已知数值键，拒绝一切非白名单键与含命令
+# 替换的值。实测注入 TOOL=/system/bin/false 或 PWNED=$(touch ...) 都被忽略。
+CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK"
+
 if [ -r "$CONFIG_FILE" ]; then
-    # 防御 CRLF：README 让用户用记事本编辑 config.cfg，而 Windows 记事本默认存 CRLF。
-    # 那样 TIER_IDLE=25 会被赋值成 "25<CR>"，回车会跟着进 state/cur_duty、日志和
-    # action.sh 的表格里，值比较也不再严格相等，排查起来很费劲。
-    # 先去掉 CR 再 source；没有 tr 就退回原来的直接 source。
     CFG_NORM="$STATE_DIR/config.norm"
     if command -v tr >/dev/null 2>&1 \
        && tr -d '\r' < "$CONFIG_FILE" > "$CFG_NORM" 2>/dev/null; then
-        . "$CFG_NORM" 2>/dev/null
-        rm -f "$CFG_NORM" 2>/dev/null
+        _src="$CFG_NORM"
     else
-        . "$CONFIG_FILE" 2>/dev/null
+        _src="$CONFIG_FILE"
     fi
+    while IFS='=' read -r _k _v; do
+        case "$_k" in ''|\#*) continue ;; esac
+        [ -n "$_v" ] || continue
+        # 拒绝含命令替换/语句分隔的 VALUE（防 PWNED=$(reboot) 之类注入）
+        case "$_v" in *=*|*'$'*|*'\`'*|*';'*|*'&'*) continue ;; esac
+        _ok=0
+        for _w in $CONFIG_KEYS; do
+            [ "$_k" = "$_w" ] && _ok=1 && break
+        done
+        [ "$_ok" = 1 ] || continue
+        eval "$_k=\$_v"
+    done < "$_src"
+    rm -f "$CFG_NORM" 2>/dev/null
 fi
+
+# ---------------------------------------------------------------------------
+# 配置校验
+# config.cfg 是被 source 进来的，任何值都直接生效。实测下来一个非法值就够
+# 让模块静默失灵：
+#   LOOP_INTERVAL=abc / 空   -> sleep 立即返回，主循环变成零延迟忙循环
+#   TIER_HOT=150 / abc       -> set_duty 一律拒绝，落入永久重试
+#   T0=50000 且 T1=47000     -> 档位阶梯跳档，2C 内 0% 直接跳到 55%
+#   FAIL_LOG_EVERY=0         -> 取模除零，失败日志彻底不打印
+# 这里统一夹紧到安全区间，非法值回落默认并记一条日志。
+# ---------------------------------------------------------------------------
+
+is_num() {
+    _v="${1:-}"
+    [ -n "$_v" ] || return 1
+    case "$_v" in -*) _v="${_v#-}" ;; esac
+    case "$_v" in ''|*[!0-9]*) return 1 ;; esac
+    return 0
+}
+
+# clamp_int <变量名> <值> <下限> <上限> <默认值>
+clamp_int() {
+    _cv="${2:-}"
+    if ! is_num "$_cv"; then
+        _cv="$5"
+        log "config: $1='${2:-}' 非法，回落到 $_cv"
+    fi
+    if [ "$_cv" -lt "$3" ] 2>/dev/null; then
+        _cv="$3"; log "config: $1 夹紧到下限 $3"
+    fi
+    if [ "$_cv" -gt "$4" ] 2>/dev/null; then
+        _cv="$4"; log "config: $1 夹紧到上限 $4"
+    fi
+    eval "$1=\$_cv"
+}
+
+sanitize_config() {
+    clamp_int TIER_QUIET   "$TIER_QUIET"   0 100 0
+    clamp_int TIER_IDLE    "$TIER_IDLE"    0 100 25
+    clamp_int TIER_WARM    "$TIER_WARM"    0 100 55
+    clamp_int TIER_HOT     "$TIER_HOT"     0 100 65
+    clamp_int TIER_VERYHOT "$TIER_VERYHOT" 0 100 78
+
+    clamp_int T0 "$T0" 0 200000 41000
+    clamp_int T1 "$T1" 0 200000 47000
+    clamp_int T2 "$T2" 0 200000 50000
+    clamp_int T3 "$T3" 0 200000 53000
+    clamp_int T4 "$T4" 0 200000 56000
+
+    # 阈值必须严格递增，否则档位阶梯会跳档甚至倒挂。
+    if [ "$T0" -ge "$T1" ] || [ "$T1" -ge "$T2" ] \
+       || [ "$T2" -ge "$T3" ] || [ "$T3" -ge "$T4" ]; then
+        log "config: 阈值非单调 (T0..T4=$T0,$T1,$T2,$T3,$T4)，回落 41/47/50/53/56 C"
+        T0=41000; T1=47000; T2=50000; T3=53000; T4=56000
+    fi
+
+    # 回滞不能吃掉相邻档位的间隔，否则永远降不下来（风扇停不下来）。
+    _gap=$((T1 - T0)); _g=$((T2 - T1)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _g=$((T3 - T2)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _g=$((T4 - T3)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _gap=$((_gap - 1)); [ "$_gap" -ge 0 ] || _gap=0
+    clamp_int HYSTERESIS "$HYSTERESIS" 0 "$_gap" 800
+
+    # LOOP_INTERVAL / RETRY_BACKOFF 下限为 1：0 或非法值会让 sleep 立即返回，
+    # 主循环退化成忙循环，binder 调用风暴 + 打满 CPU。
+    clamp_int LOOP_INTERVAL  "$LOOP_INTERVAL"  1 3600 5
+    clamp_int STARTUP_GRACE  "$STARTUP_GRACE"  0 3600 45
+    clamp_int RETRY_BACKOFF  "$RETRY_BACKOFF"  1 3600 3
+    # FAIL_LOG_EVERY 下限为 1：0 会导致取模除零，失败日志彻底消失。
+    clamp_int FAIL_LOG_EVERY "$FAIL_LOG_EVERY" 1 3600 12
+    clamp_int MAX_FAIL_STREAK "$MAX_FAIL_STREAK" 1 1000 10
+
+    clamp_int RPM_CAP  "$RPM_CAP"  0 100000 12000
+    clamp_int RPM_DUTY "$RPM_DUTY" 0 100     88
+    clamp_int RPM_RELEASE_RANK     "$RPM_RELEASE_RANK"     0 5 3
+    clamp_int OVERHEAT_RELEASE_RANK "$OVERHEAT_RELEASE_RANK" 0 5 3
+}
 
 log() {
     # 用绝对路径：函数名叫 log 会遮蔽同名二进制，裸写 log 会无限递归刷爆 logd。
     /system/bin/log -t "$LOG_TAG" "$*" 2>/dev/null || echo "$LOG_TAG: $*"
 }
+
+# 配置加载完立刻校验一次，之后所有逻辑拿到的都是合法值。
+sanitize_config
 
 # ---------------------------------------------------------------------------
 # Fan access.
@@ -146,11 +264,39 @@ log() {
 # 万一对端卡住不至于把整个控制循环挂死。
 # ---------------------------------------------------------------------------
 
-if [ -x /system/bin/timeout ]; then
-    run_tool() { /system/bin/timeout 5 "$TOOL" "$@" 2>/dev/null; }
-else
-    run_tool() { "$TOOL" "$@" 2>/dev/null; }
-fi
+TOOL_TIMEOUT=5
+
+# 调用 MCU 工具并带看门狗。这是整个控制循环最不能出错的环节：
+#   1) 绝不通过 $(...) 管道捕获工具输出。若工具内部又 spawn 了子进程（脚本、
+#      脚本型 wrapper、binder 客户端都常见），被强杀后那个孙子进程会成孤儿
+#      并继续持有管道写端，导致 $() 一直阻塞到孙子自然结束 —— 看门狗彻底
+#      失效。实测 toybox timeout 杀"脚本内含 sleep 60"要等满 60s 而非 5s。
+#      输出一律重定向到临时文件，事后 cat，从根上避开管道。
+#   2) 不依赖 /system/bin/timeout 二进制：真机上 toybox timeout 杀"经 shebang
+#      二次 exec 的脚本"时信号传不到，5s 看门狗退化为等满 60s。所以这里自己
+#      实现：后台跑 + 轮询 kill -0 + 超时 kill -9 整个进程组，工具若是脚本，
+#      其子进程（sleep / 子 shell）一并被清，不留孤儿。
+run_tool() {
+    _of=$(mktemp "$STATE_DIR/.tool.XXXXXX" 2>/dev/null) || _of="$STATE_DIR/.tool.$$"
+    "$TOOL" "$@" > "$_of" 2>/dev/null &
+    _tp=$!
+    _tw=0
+    while [ "$_tw" -lt "$TOOL_TIMEOUT" ]; do
+        kill -0 "$_tp" 2>/dev/null || break
+        sleep 1
+        _tw=$((_tw + 1))
+    done
+    if [ -n "$_tp" ] && kill -0 "$_tp" 2>/dev/null; then
+        # 杀整个进程组：工具若是脚本，其子进程一并清除
+        /system/bin/kill -9 "-$_tp" 2>/dev/null || kill -9 "$_tp" 2>/dev/null
+        # 不走 log()：run_tool 输出被 $( ) 捕获，写 stdout 会混进 success 匹配。
+        /system/bin/log -t "$LOG_TAG" "WARN: $TOOL $* 超时 ${TOOL_TIMEOUT}s，已强杀" \
+            2>/dev/null || echo "$LOG_TAG: WARN: $* timeout" >&2
+    fi
+    wait "$_tp" 2>/dev/null
+    cat "$_of" 2>/dev/null
+    rm -f "$_of" 2>/dev/null
+}
 
 set_duty() {
     # $1 = duty percent 0-100
@@ -164,18 +310,22 @@ set_duty() {
 }
 
 get_duty() {
-    # $1 = max seconds to wait for a valid reply
+    # $1 = max attempts (NOT seconds — 每次尝试可能被 TOOL_TIMEOUT 拖到 5s)
     wait_s="${1:-3}"
-    n=0
-    while [ "$n" -lt "$wait_s" ]; do
+    # 注意：这里必须用独立变量名。原来用 n，而 main() 的循环计数器也叫 n，
+    # dash 里没有作用域隔离，get_duty 一返回就把 main 的 n 清零了 ——
+    # 结果 "每 6 个循环校验一次持有值" 的漂移校验几乎永远不会触发。
+    _dn=0
+    while [ "$_dn" -lt "$wait_s" ]; do
         out="$(run_tool getfaninfo)"
         d=$(echo "$out" | sed -n 's/^duty=\([0-9][0-9]*\).*/\1/p' | head -n 1)
         if [ -n "$d" ] && [ "$d" -le 100 ] 2>/dev/null; then
             echo "$d"
             return 0
         fi
-        sleep 1
-        n=$((n + 1))
+        _dn=$((_dn + 1))
+        # 最后一次不必再等
+        [ "$_dn" -lt "$wait_s" ] && sleep 1
     done
     return 1
 }
@@ -206,12 +356,13 @@ exit_test_mode() {
     rm -f "$IN_TEST"
     run_tool setfantestmode 0 >/dev/null 2>&1
     setprop sys.pxrfanservice.state 2
-    n=0
-    while [ "$n" -lt 15 ]; do
+    # 同样不能用 n（会覆盖 main 的循环计数器），见 get_duty 里的说明。
+    _en=0
+    while [ "$_en" -lt 15 ]; do
         s=$(getprop init.svc.pxrfanservice 2>/dev/null)
-        [ "$s" = "running" ] && [ "$n" -ge 3 ] && return 0
+        [ "$s" = "running" ] && [ "$_en" -ge 3 ] && return 0
         sleep 1
-        n=$((n + 1))
+        _en=$((_en + 1))
     done
     log "vendor re-handshake did not complete"
     return 1
@@ -302,8 +453,14 @@ tier_duty() {
     esac
 }
 
-# decide <tier> <rpm>  ->  prints "<name> <duty>"
+# decide <tier> <rpm>  ->  prints "<真实档位名> <duty> <rpm|tier>"
 # 修 [2]：rpm 升速必须同时满足温度闸门，否则一旦冲上 12000 就再也降不下来。
+#
+# 第三个字段标出 duty 的来源（rpm 闸门 / 温度档位）。原来这里直接把
+# "RPM-CAP" 当作档位名回给调用方，被写进 state/cur_tier；而 pick_tier
+# 只认 QUIET..VERYHOT，读到 RPM-CAP 就当成"未知"回退成 IDLE，
+# 于是紧接着的那次降温完全不走回滞，action.sh cycle 也会从头开始。
+# 现在 cur_tier 只写真实档位名，闸门状态单列一个字段。
 decide() {
     _tier="$1"
     _rpm="$2"
@@ -313,9 +470,9 @@ decide() {
     if [ -n "$_rpm" ] && [ "$RPM_CAP" -gt 0 ] 2>/dev/null \
        && [ "$_rpm" -ge "$RPM_CAP" ] 2>/dev/null \
        && [ "$_r" -ge "$RPM_RELEASE_RANK" ]; then
-        echo "RPM-CAP $RPM_DUTY"
+        echo "$_tier $RPM_DUTY rpm"
     else
-        echo "$_tier $_d"
+        echo "$_tier $_d tier"
     fi
     return 0
 }
@@ -331,11 +488,12 @@ should_reengage() {
 # Enable / disable
 # ---------------------------------------------------------------------------
 
-enable() {
+# 原名 enable —— 与 POSIX 同名内建冲突（shellcheck SC3044），改名。
+enable_control() {
     if ! enter_test_mode; then
         return 1
     fi
-    rm -f "$DISABLED"
+    rm -f "$DISABLED" "$GAVE_UP"
     : > "$ENABLED"
     log "MCU test mode engaged, vendor duty writes now rejected"
     return 0
@@ -351,6 +509,19 @@ disable() {
 
 is_enabled() {
     [ -f "$ENABLED" ]
+}
+
+# 判断 pid 是否是"还活着的 service.sh"。保守处理：读不到 /proc 时只信 kill -0，
+# 读得到就再核一次 cmdline，防止 pid 复用到别的进程上误杀自己人。
+svc_alive() {
+    _p="${1:-}"
+    [ -n "$_p" ] || return 1
+    [ "$_p" != "$$" ] || return 1
+    kill -0 "$_p" 2>/dev/null || return 1
+    if [ -r "/proc/$_p/cmdline" ]; then
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q "service.sh" || return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -373,6 +544,22 @@ main() {
         return 1
     fi
 
+    # 单实例保护。原来只靠 action.sh 里的 pgrep/pkill -f，一旦它们不存在或
+    # 匹配失败就会跑出两个循环互相抢写 duty。这里用 pid 文件 + kill -0 兜底，
+    # 能读到 /proc 时再校一次 cmdline，避免 pid 复用导致误判。
+    if [ -r "$PID_FILE" ]; then
+        _old=$(cat "$PID_FILE" 2>/dev/null)
+        if svc_alive "$_old"; then
+            log "another service.sh (pid $_old) already running, exiting"
+            return 0
+        fi
+    fi
+    echo $$ > "$PID_FILE" 2>/dev/null
+    trap 'rm -f "$PID_FILE" 2>/dev/null' EXIT
+
+    # 上一次运行如果因写入持续失败而放弃过，新一轮重新尝试。
+    rm -f "$GAVE_UP" 2>/dev/null
+
     # 修 [5]：用户显式关过 -> 不接管，等 action.sh enable 撤销。
     if [ -f "$DISABLED" ]; then
         log "disabled by user, standing by (action.sh enable to re-enable)"
@@ -390,7 +577,7 @@ main() {
             log "found stale test-mode flag, exiting test mode to restore vendor"
             exit_test_mode
         fi
-        if ! enable; then
+        if ! enable_control; then
             log "ERROR: failed to enter test mode"
             return 1
         fi
@@ -452,18 +639,24 @@ main() {
             sleep "$LOOP_INTERVAL"
             continue
         fi
-        cur_tier_name=${pos%% *}
-        desired=${pos##* }
+        # decide 输出 "<真实档位名> <duty> <rpm|tier>"。用 set -- 拆，省三次 fork。
+        # 这里就是要按空格拆字段，不需要引号
+        # shellcheck disable=SC2086
+        set -- $pos
+        cur_tier_name="$1"
+        desired="$2"
+        gate="$3"
 
         # Only touch the fan when the desired duty actually changes.
         if [ "$desired" != "$cur_duty_written" ]; then
             if set_duty "$desired"; then
                 fail_streak=0
-                got=$(get_duty 4)
+                got=$(get_duty 2)
                 cur_duty_written="$desired"
                 echo "$desired" > "$CUR_DUTY"
                 echo "$cur_tier_name" > "$CUR_TIER"
-                log "skin $((t / 1000))C rpm ${rpm_now:-?} -> $cur_tier_name duty $desired (reported ${got:-?})"
+                date +%s > "$LAST_OK" 2>/dev/null
+                log "skin $((t / 1000))C rpm ${rpm_now:-?} -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
             else
                 # 修 [1] 的核心：写入被拒 == MCU 那边锁已经没了，标记文件不可信。
                 fail_streak=$((fail_streak + 1))
@@ -474,12 +667,25 @@ main() {
                 if enter_test_mode; then
                     if set_duty "$desired"; then
                         fail_streak=0
-                        got=$(get_duty 4)
+                        got=$(get_duty 2)
                         cur_duty_written="$desired"
                         echo "$desired" > "$CUR_DUTY"
                         echo "$cur_tier_name" > "$CUR_TIER"
-                        log "re-armed ok: skin $((t / 1000))C -> $cur_tier_name duty $desired (reported ${got:-?})"
+                        date +%s > "$LAST_OK" 2>/dev/null
+                        log "re-armed ok: skin $((t / 1000))C -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
                     fi
+                fi
+
+                # 放弃阈值：写入持续被拒说明这一轮拿不到控制权（固件变更 /
+                # 权限丢失 / MCU 异常）。再重试下去只会让 MCU 一直卡在 test
+                # mode —— 厂商的 duty 帧同样被拒，风扇没人管，而 state 里
+                # 还写着"本模块温控"。到上限就退出 test mode 交还原厂。
+                if [ "$fail_streak" -ge "$MAX_FAIL_STREAK" ]; then
+                    log "ERROR: $fail_streak consecutive rejections, giving up and handing back to vendor"
+                    : > "$GAVE_UP" 2>/dev/null
+                    rm -f "$ENABLED" 2>/dev/null
+                    exit_test_mode
+                    return 1
                 fi
                 sleep "$RETRY_BACKOFF"
             fi
@@ -487,7 +693,7 @@ main() {
 
         # 每 ~6 个循环（约 30s）校验一次持有值。漂移了就静默重写。
         if [ $((n % 6)) -eq 0 ] && [ -n "$cur_duty_written" ]; then
-            held=$(get_duty 4)
+            held=$(get_duty 2)
             if [ -n "$held" ] && [ "$held" != "$cur_duty_written" ]; then
                 log "drift detected: wanted $cur_duty_written, MCU reports $held, re-asserting"
                 set_duty "$cur_duty_written" >/dev/null 2>&1
@@ -529,6 +735,7 @@ selftest() {
 
     echo ""
     echo "== [2] RPM 升速闸门（RPM_CAP=$RPM_CAP RPM_DUTY=$RPM_DUTY 闸门档位=$RPM_RELEASE_RANK）=="
+    echo "  输出格式: <真实档位名> <duty> <rpm|tier>"
     echo "  decide IDLE    12500 -> $(decide IDLE 12500)     <- 低温柔闸门挡住，转速可回落"
     echo "  decide IDLE     7000 -> $(decide IDLE 7000)"
     echo "  decide WARM    12500 -> $(decide WARM 12500)"
@@ -537,6 +744,15 @@ selftest() {
     echo "  decide IDLE         -> $(decide IDLE '')"
     echo "  对比：上游无闸门时 IDLE/12500 会得到 RPM-CAP $RPM_DUTY 并永久自锁"
     echo "  实测：duty 88% -> 13671 RPM；duty 78% -> 12220 RPM（故上游确实会锁死）"
+
+    echo ""
+    echo "== [新] 配置校验（sanitize_config）=="
+    echo "  当前生效值: LOOP_INTERVAL=$LOOP_INTERVAL RETRY_BACKOFF=$RETRY_BACKOFF"
+    echo "              FAIL_LOG_EVERY=$FAIL_LOG_EVERY MAX_FAIL_STREAK=$MAX_FAIL_STREAK"
+    echo "              HYSTERESIS=$HYSTERESIS (上限=相邻档位最小间隔-1)"
+    echo "  阈值单调: T0=$T0 < T1=$T1 < T2=$T2 < T3=$T3 < T4=$T4"
+    echo "  档位 duty: QUIET=$TIER_QUIET IDLE=$TIER_IDLE WARM=$TIER_WARM HOT=$TIER_HOT VERYHOT=$TIER_VERYHOT"
+    echo "  非法值会被夹紧/回落并记日志，用 --dumpcfg 看最终生效值。"
 
     echo ""
     echo "== [4] 过热交回后的重新接管闸门（OVERHEAT_RELEASE_RANK=$OVERHEAT_RELEASE_RANK）=="
@@ -553,9 +769,25 @@ selftest() {
     return 0
 }
 
+# 打印校验后的最终生效配置（KEY=VALUE），供 action.sh 直接 source，
+# 保证 status 显示的阈值与 service.sh 实际使用的是同一份，不会出现
+# "配置写错了但 status 还显示错的值" 这种误导。
+dumpcfg() {
+    for _k in TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT \
+              T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE \
+              RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK \
+              RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK; do
+        eval "printf '%s=%s\n' \"\$_k\" \"\$$_k\""
+    done
+}
+
 case "${1:-}" in
     --selftest|-t)
         selftest
+        exit 0
+        ;;
+    --dumpcfg)
+        dumpcfg
         exit 0
         ;;
 esac
