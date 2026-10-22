@@ -177,7 +177,7 @@ loop exits by itself.
 
 **6. CRLF line endings killed the module outright.**
 Android's sh does not treat CR as whitespace, so a CRLF `service.sh` fails on every
-assignment——
+assignment—
 
 ```
 $ sh service_crlf.sh --selftest
