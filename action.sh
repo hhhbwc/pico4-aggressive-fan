@@ -230,12 +230,21 @@ tier_table() {
     printf "  %-5s-%-5sC  warm    duty=%s%%\n" "$((T1 / 1000))" "$((T2 / 1000))" "$TIER_WARM"
     printf "  %-5s-%-5sC  hot     duty=%s%%\n" "$((T2 / 1000))" "$((T3 / 1000))" "$TIER_HOT"
     printf "  %-5s-%-5sC  vhot    duty=%s%%\n" "$((T3 / 1000))" "$((T4 / 1000))" "$TIER_VERYHOT"
-    printf "  >= %sC       交回原厂策略\n" "$((T4 / 1000))"
+    if [ "${OVERHEAT_HANDBACK:-0}" = "1" ]; then
+        printf "  >= %sC       交回原厂策略 (OVERHEAT_HANDBACK=1)\n" "$((T4 / 1000))"
+    else
+        printf "  >= %sC       overheat duty=%s%% (原厂只有 35-40%%)\n" "$((T4 / 1000))" "${TIER_OVERHEAT:-88}"
+    fi
     printf "  回滞 HYSTERESIS=%s mC (%sC) | RPM 升速闸门档位=%s | 过热重新接管档位=%s\n" \
         "$HYSTERESIS" "$(awk "BEGIN{printf \"%.1f\", $HYSTERESIS/1000}")" \
         "$RPM_RELEASE_RANK" "$OVERHEAT_RELEASE_RANK"
     printf "  RPM 闸门: rpm>=%s 时升到 duty=%s%% | 连续失败 %s 次后放弃并交还原厂\n" \
         "$RPM_CAP" "$RPM_DUTY" "$MAX_FAIL_STREAK"
+    printf "  第二温度源=充电IC NTC，档位 %s/%s/%s/%s/%s mC 回滞 %s\n" \
+        "${CHG0:-60000}" "${CHG1:-65000}" "${CHG2:-70000}" "${CHG3:-75000}" "${CHG4:-79000}" "${CHG_HYSTERESIS:-1500}"
+    _wk=$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
+    printf "  熄屏压档: 上限档=%s (0=QUIET 1=IDLE 2=WARM … -1=关闭) | 当前 mWakefulness=%s\n" \
+        "${SCREEN_OFF_MAX_RANK:--1}" "${_wk:-?}"
 }
 
 status() {

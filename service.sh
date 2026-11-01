@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# PICO 4 Fan Auto Temp Control — v1.5.0
+# PICO 4 Fan Auto Temp Control — v1.6.0
 #
 # 本版本修掉一批会让模块静默失灵的缺陷，设计意图（皮肤温度分档 + 绕过原厂锁）
 # 与档位机制保持不变。逐条说明见下面的注释和 CHANGELOG.md。
@@ -54,6 +54,22 @@
 #     + 超时 kill -9 整个进程组，输出重定向到临时文件事后 cat。实测脚本型工具卡死
 #     被稳定掐在 5s。
 #
+# v1.6.0 新增（实机排查「插着电却掉电」「熄屏后风扇仍满转」）
+# ---------------------------------------------------------------------------
+# [9] 过热档不再交回原厂。实测原厂锁 duty 40% / 7790RPM，比本模块任何一档都弱；
+#     越热越交给一个更不制风的策略是反效果。新增 OVERHEAT_HANDBACK（默认 0 =
+#     自己吃 TIER_OVERHEAT），设 1 可恢复上游行为。
+# [10] 充电 IC 的 NTC 并入温度源。charger_temp 到 80°C（charger_temp_max=800）
+#     时驱动会把输入从 9V/3A 砍回 5V/1.55A，而 5V 档 7.75W 低于整机功耗
+#     （8 核满载约 11W），电池转为净放电 —— 这就是「插着还掉电」。热框架里
+#     pm8150b_tz 没有绑定 cooling device，只能上报不能处置。
+# [11] 漂移校验原来把写入失败吞掉：cur_duty 一直显示 88 而硬件早回落原厂转速。
+#     现在失败即判定丢锁 -> 清 IN_TEST -> 重新接管。注入故障实测 1 秒内恢复。
+# [12] 睡眠时风扇会「冻住」（守护被冻结，停在上次写入的 duty 上）。新增
+#     SCREEN_OFF_MAX_RANK：非 Awake 时压到 IDLE，真烫则不压。
+# 另：皮肤阈值按本机重标定 41/47/50/53/56 -> 57/63/65/67/69；修掉 config.cfg
+#     行内注释导致所有带注释的键被判定非法、静默回落默认值的缺陷。
+#
 # 其它：state/last_run.log 死变量清掉。
 #
 # 用法补充
@@ -97,16 +113,36 @@ TIER_IDLE="25"        # T0-T1
 TIER_WARM="55"        # T1-T2
 TIER_HOT="65"         # T2-T3
 TIER_VERYHOT="78"     # T3-T4
+TIER_OVERHEAT="88"    # >T4：v1.6 默认自己吃满风，不再交回原厂
+
+# 修 [9]：1 = 保留上游"过热交回原厂"的柔性保护；0 = 过热档吃 TIER_OVERHEAT。
+# 实测原厂策略只锁 duty 40% / 7790 RPM，比本模块任何一档都弱 —— 越热越交给
+# 一个更不制风的策略，是反效果。
+OVERHEAT_HANDBACK="0"
+
+# 修 [10]：第二个温度源 = 充电 IC 的 NTC（单位 0.1C，代码里 *100 换算）。
+# 它才是"停充"的直接阈值来源：charger_temp_max=800 即 80C，越过它驱动会把
+# 输入砍到 277mA；而 /sys/class/thermal 里的 pm8150b_tz 没有绑定任何 cooling
+# device，只能上报不能处置，只能本模块自己管。节点读不到/返回 -22 时该源
+# 自动退出，退回纯皮肤分档。
+CHG_TEMP_NODE="${PICO4_CHG_TEMP_NODE:-/sys/class/power_supply/battery/charger_temp}"
+CHG0=60000   # -> idle
+CHG1=65000   # -> warm
+CHG2=70000   # -> hot
+CHG3=75000   # -> very hot
+CHG4=79000   # -> overheat（卡在驱动 80C 降档之前）
+CHG_HYSTERESIS=1500
 
 # Thresholds, in millidegrees C.
-# T0 默认从 38000 提到 41000：PICO 4 息屏静置的皮温实测就在 37.5-38.0C 之间飘，
-# 原来的 T0=38C 正好压在待机皮温上，配合"第一档直接 45%(约 7700RPM)"，
-# 会造成 0 <-> 7700 RPM 无限横跳。
-T0=41000   # quiet -> idle
-T1=47000   # idle -> warm
-T2=50000   # warm -> hot
-T3=53000   # hot -> very hot
-T4=56000   # very hot -> overheat (hand back to vendor)
+# v1.6 按本机实测重标定（2026-10-31，PICO A8110 + 眼追面捕套件）：这台机器只要
+# 醒着，SoC 就在 63-76C、虚拟皮肤 zone86 常年 57-61C（8 核满载 66C+）。旧的
+# T0..T4=41/47/50/53/56 让"醒着"就等于"过热"，风扇从早到晚贴 88% —— 这就是
+# "熄屏了还很吵"的直接原因。充电安全不靠这组值，靠下面的 charger_temp 那一路。
+T0=57000   # quiet -> idle
+T1=63000   # idle -> warm
+T2=65000   # warm -> hot
+T3=67000   # hot -> very hot
+T4=69000   # very hot -> overheat
 
 # Hysteresis in millidegrees C. 降档需要低于 (该档阈值 - HYSTERESIS)。
 # 0.8C 起步；配合 T0=41C，待机时不会再反复起跳。
@@ -136,6 +172,16 @@ FAIL_LOG_EVERY=12
 # 模块会无限重试、state 里却始终显示"正在控温"，风扇实际没人管。
 MAX_FAIL_STREAK=10
 
+# 修 [12]：熄屏/睡眠时把档位压下来。设备睡过去后守护进程会被内核冻结，风扇会
+# 停在最后一次写入的 duty 上 —— 睡前 88%，整晚都是 88%。所以检测到非 Awake
+# 就主动压档；真的烫（充电 IC >= CHG3 或皮肤 >= T4）则不压，安全优先。
+# 0=QUIET 1=IDLE 2=WARM 3=HOT 4=VERYHOT，-1=不启用。
+SCREEN_OFF_MAX_RANK=1
+# dumpsys power 是 binder 调用，每 N 个循环刷新一次并缓存（N × LOOP_INTERVAL）。
+WAKE_DUMP_INTERVAL=6
+WAKE_SRC="${PICO4_WAKE_SRC:-}"
+WAKE_CACHE=""
+
 # ---------------------------------------------------------------------------
 # Load config.cfg if present. Each line is KEY=VALUE, '#' starts a comment.
 # ---------------------------------------------------------------------------
@@ -146,7 +192,7 @@ MAX_FAIL_STREAK=10
 # (2) 值里的 $(...) 或反引号会在 source 时被执行（root 下即任意代码执行）。
 # 所以这里逐行解析：先去 CR，只接受已知数值键，拒绝一切非白名单键与含命令
 # 替换的值。实测注入 TOOL=/system/bin/false 或 PWNED=$(touch ...) 都被忽略。
-CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK"
+CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL"
 
 if [ -r "$CONFIG_FILE" ]; then
     CFG_NORM="$STATE_DIR/config.norm"
@@ -158,6 +204,11 @@ if [ -r "$CONFIG_FILE" ]; then
     fi
     while IFS='=' read -r _k _v; do
         case "$_k" in ''|\#*) continue ;; esac
+        [ -n "$_v" ] || continue
+        # 去掉行尾注释再校验。config.cfg 里几乎每行都是 `KEY=25   # 说明` 的形式，
+        # 不剥掉的话值里带着 '#' 和非数字文本，is_num 判非法 -> 静默回落默认值，
+        # 用户改的参数根本不生效（v1.5.0 的实测缺陷：14 个键全部回落到默认）。
+        _v=$(printf '%s' "$_v" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//' 2>/dev/null)
         [ -n "$_v" ] || continue
         # 拒绝含命令替换/语句分隔的 VALUE（防 PWNED=$(reboot) 之类注入）
         case "$_v" in *=*|*'$'*|*'\`'*|*';'*|*'&'*) continue ;; esac
@@ -213,17 +264,17 @@ sanitize_config() {
     clamp_int TIER_HOT     "$TIER_HOT"     0 100 65
     clamp_int TIER_VERYHOT "$TIER_VERYHOT" 0 100 78
 
-    clamp_int T0 "$T0" 0 200000 41000
-    clamp_int T1 "$T1" 0 200000 47000
-    clamp_int T2 "$T2" 0 200000 50000
-    clamp_int T3 "$T3" 0 200000 53000
-    clamp_int T4 "$T4" 0 200000 56000
+    clamp_int T0 "$T0" 0 200000 57000
+    clamp_int T1 "$T1" 0 200000 63000
+    clamp_int T2 "$T2" 0 200000 65000
+    clamp_int T3 "$T3" 0 200000 67000
+    clamp_int T4 "$T4" 0 200000 69000
 
     # 阈值必须严格递增，否则档位阶梯会跳档甚至倒挂。
     if [ "$T0" -ge "$T1" ] || [ "$T1" -ge "$T2" ] \
        || [ "$T2" -ge "$T3" ] || [ "$T3" -ge "$T4" ]; then
-        log "config: 阈值非单调 (T0..T4=$T0,$T1,$T2,$T3,$T4)，回落 41/47/50/53/56 C"
-        T0=41000; T1=47000; T2=50000; T3=53000; T4=56000
+        log "config: 阈值非单调 (T0..T4=$T0,$T1,$T2,$T3,$T4)，回落 57/63/65/67/69 C"
+        T0=57000; T1=63000; T2=65000; T3=67000; T4=69000
     fi
 
     # 回滞不能吃掉相邻档位的间隔，否则永远降不下来（风扇停不下来）。
@@ -246,6 +297,25 @@ sanitize_config() {
     clamp_int RPM_DUTY "$RPM_DUTY" 0 100     88
     clamp_int RPM_RELEASE_RANK     "$RPM_RELEASE_RANK"     0 5 3
     clamp_int OVERHEAT_RELEASE_RANK "$OVERHEAT_RELEASE_RANK" 0 5 3
+
+    # v1.6 新增键
+    clamp_int TIER_OVERHEAT        "$TIER_OVERHEAT"        0 100  88
+    clamp_int OVERHEAT_HANDBACK    "$OVERHEAT_HANDBACK"    0 1    0
+    clamp_int CHG0 "$CHG0" 0 200000 60000
+    clamp_int CHG1 "$CHG1" 0 200000 65000
+    clamp_int CHG2 "$CHG2" 0 200000 70000
+    clamp_int CHG3 "$CHG3" 0 200000 75000
+    clamp_int CHG4 "$CHG4" 0 200000 79000
+    clamp_int CHG_HYSTERESIS "$CHG_HYSTERESIS" 0 20000 1500
+    clamp_int SCREEN_OFF_MAX_RANK "$SCREEN_OFF_MAX_RANK" -1 5 1
+    clamp_int WAKE_DUMP_INTERVAL  "$WAKE_DUMP_INTERVAL"   1 360 6
+
+    # 充电 IC 阈值也必须严格递增，否则合流出来的档位会跳档。
+    if [ "$CHG0" -ge "$CHG1" ] || [ "$CHG1" -ge "$CHG2" ] \
+       || [ "$CHG2" -ge "$CHG3" ] || [ "$CHG3" -ge "$CHG4" ]; then
+        log "config: 充电IC阈值非单调 ($CHG0,$CHG1,$CHG2,$CHG3,$CHG4)，回落 60/65/70/75/79 C"
+        CHG0=60000; CHG1=65000; CHG2=70000; CHG3=75000; CHG4=79000
+    fi
 }
 
 log() {
@@ -386,48 +456,122 @@ tier_rank() {
     esac
 }
 
+run_dumpsys() {
+    if [ -x /system/bin/timeout ]; then
+        /system/bin/timeout 5 dumpsys power 2>/dev/null
+    else
+        dumpsys power 2>/dev/null
+    fi
+}
+
+# 修 [10]：读充电 IC 的 NTC。节点单位是 0.1C（实测 664 = 66.4C），换算成千分之一度。
+# 读不到 / 非数字 / 负值（-22 表示该节点不支持）时返回空，让调用方把这一路关掉。
+read_chg_temp() {
+    _v=$(cat "$CHG_TEMP_NODE" 2>/dev/null | tr -d '\r\n ')
+    case "$_v" in
+        ''|*[!0-9]*) echo ""; return 1 ;;
+    esac
+    echo "$((_v * 100))"
+}
+
+skin_rank() {
+    _r=0
+    [ "$1" -ge "$T0" ] && _r=1
+    [ "$1" -ge "$T1" ] && _r=2
+    [ "$1" -ge "$T2" ] && _r=3
+    [ "$1" -ge "$T3" ] && _r=4
+    [ "$1" -ge "$T4" ] && _r=5
+    echo "$_r"
+}
+
+chg_rank() {
+    [ -n "$1" ] || { echo 0; return; }
+    _r=0
+    [ "$1" -ge "$CHG0" ] && _r=1
+    [ "$1" -ge "$CHG1" ] && _r=2
+    [ "$1" -ge "$CHG2" ] && _r=3
+    [ "$1" -ge "$CHG3" ] && _r=4
+    [ "$1" -ge "$CHG4" ] && _r=5
+    echo "$_r"
+}
+
+# 想从 new_rank 这一档降下去，两个源都必须凉到「该档阈值 - 各自回滞」以下。
+cool_enough() {
+    case "$1" in
+        5) _ts=$T4;  _tc=$CHG4 ;;
+        4) _ts=$T3;  _tc=$CHG3 ;;
+        3) _ts=$T2;  _tc=$CHG2 ;;
+        2) _ts=$T1;  _tc=$CHG1 ;;
+        1) _ts=$T0;  _tc=$CHG0 ;;
+        *) return 0 ;;
+    esac
+    [ "$TS" -lt "$((_ts - HYSTERESIS))" ] || return 1
+    if [ -n "$TC" ]; then
+        [ "$TC" -lt "$((_tc - CHG_HYSTERESIS))" ] || return 1
+    fi
+    return 0
+}
+
+# 修 [12]：wakefulness。缓存，避免每 5 秒一次 binder 调用。
+wake_state() {
+    _force="${1:-0}"
+    if [ "$_force" = "1" ] || [ -z "$WAKE_CACHE" ]; then
+        if [ -n "$WAKE_SRC" ] && [ -r "$WAKE_SRC" ]; then
+            WAKE_CACHE=$(cat "$WAKE_SRC" 2>/dev/null | tr -d '\r\n')
+        else
+            WAKE_CACHE=$(run_dumpsys | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
+        fi
+    fi
+    echo "$WAKE_CACHE"
+}
+
 pick_tier() {
-    t=$(cat "$TEMP_NODE" 2>/dev/null)
-    case "$t" in
+    # 修 [10]：档位取「皮肤」与「充电 IC」两路里较高的那个；修 [3]/[8]：降档时
+    # 两个源都要凉下来才算（各用各自的回滞）。
+    TS=$(cat "$TEMP_NODE" 2>/dev/null)
+    case "$TS" in
         ''|*[!0-9]*) return 1 ;;
     esac
+    TC=$(read_chg_temp)
+
+    rank_s=$(skin_rank "$TS")
+    rank_c=$(chg_rank "$TC")
+    rank=$rank_s
+    [ "$rank_c" -gt "$rank" ] && rank=$rank_c
 
     prev=$(cat "$CUR_TIER" 2>/dev/null)
     case "$prev" in
-        QUIET|IDLE|WARM|HOT|VERYHOT) ;;
+        QUIET|IDLE|WARM|HOT|VERYHOT|OVERHEAT) ;;
         *) prev=IDLE ;;   # unknown / first run: behave like IDLE
     esac
     prev_rank=$(tier_rank "$prev")
 
-    # 升档：纯阈值，跨过就上（快速响应升温，安全优先）。
-    rank=0
-    [ "$t" -ge "$T0" ] && rank=1
-    [ "$t" -ge "$T1" ] && rank=2
-    [ "$t" -ge "$T2" ] && rank=3
-    [ "$t" -ge "$T3" ] && rank=4
-    [ "$t" -ge "$T4" ] && rank=5
-
     if [ "$rank" -ge "$prev_rank" ]; then
+        # 升档：纯阈值，跨过就上（快速响应升温，安全优先）。
         new_rank=$rank
     else
-        # 降档：修 [3]，逐档检查真实回滞。
-        # 要降到 rank-1，必须低于「rank-1 对应阈值 - HYSTERESIS」。
         new_rank=$prev_rank
         while [ "$new_rank" -gt "$rank" ]; do
-            case "$new_rank" in
-                5) thr=$T4 ;;
-                4) thr=$T3 ;;
-                3) thr=$T2 ;;
-                2) thr=$T1 ;;
-                1) thr=$T0 ;;
-                *) break ;;
-            esac
-            if [ "$t" -lt "$((thr - HYSTERESIS))" ]; then
+            if cool_enough "$new_rank"; then
                 new_rank=$((new_rank - 1))
             else
                 break
             fi
         done
+    fi
+
+    # 修 [12]：熄屏/睡眠压档。守护被冻结后风扇会停在上次写入的 duty 上，
+    # 所以必须在睡前压下来。真烫（充电 IC >= CHG3 或皮肤 >= T4）则不压。
+    if [ "$SCREEN_OFF_MAX_RANK" -ge 0 ] 2>/dev/null && [ "$new_rank" -gt "$SCREEN_OFF_MAX_RANK" ]; then
+        _w=$(wake_state)
+        if [ -n "$_w" ] && [ "$_w" != "Awake" ]; then
+            _hot=0
+            if [ -n "$TC" ] && [ "$TC" -ge "$CHG3" ] 2>/dev/null; then _hot=1; fi
+            if [ "$TS" -ge "$T4" ] 2>/dev/null; then _hot=1; fi
+            if [ "$_hot" = "0" ]; then
+                new_rank=$SCREEN_OFF_MAX_RANK
+            fi
+        fi
     fi
 
     case "$new_rank" in
@@ -448,7 +592,13 @@ tier_duty() {
         WARM)     echo "$TIER_WARM" ;;
         HOT)      echo "$TIER_HOT" ;;
         VERYHOT)  echo "$TIER_VERYHOT" ;;
-        OVERHEAT) echo "" ;;   # not a duty; caller handles handback
+        OVERHEAT)
+            # 修 [9]：默认不再交回原厂，过热档直接吃 TIER_OVERHEAT。
+            if [ "$OVERHEAT_HANDBACK" = "1" ]; then
+                echo ""            # 老行为：空值 = 由调用方走交回原厂
+            else
+                echo "$TIER_OVERHEAT"
+            fi ;;
         *) return 1 ;;
     esac
 }
@@ -599,6 +749,11 @@ main() {
             return 0
         fi
 
+        # 修 [12]：周期性刷新熄屏状态（缓存，避免每圈都调 dumpsys）
+        if [ $((n % WAKE_DUMP_INTERVAL)) -eq 0 ]; then
+            wake_state 1 >/dev/null
+        fi
+
         tier=$(pick_tier)
         if [ -z "$tier" ]; then
             # Sensor read failed; keep last duty, do not guess.
@@ -609,7 +764,7 @@ main() {
 
         # Overheat: hand the fan back to the vendor so its high-temp protection
         # runs. 修 [4]：这次要真的交回一段时间，见下面重新接管的闸门。
-        if [ "$tier" = "OVERHEAT" ]; then
+        if [ "$tier" = "OVERHEAT" ] && [ "$OVERHEAT_HANDBACK" = "1" ]; then
             if [ -f "$IN_TEST" ]; then
                 exit_test_mode
                 cur_duty_written=""
@@ -691,12 +846,26 @@ main() {
             fi
         fi
 
-        # 每 ~6 个循环（约 30s）校验一次持有值。漂移了就静默重写。
-        if [ $((n % 6)) -eq 0 ] && [ -n "$cur_duty_written" ]; then
+        # 每 ~6 个循环（约 30s）校验一次持有值。漂移了就重写。
+        # 修 [11]：重写失败必须当成"MCU 侧锁丢了"处理 —— 这里原来把返回值吞了，
+        # 于是 cur_duty 一直显示 88 而硬件早回落到原厂转速，模块变成僵尸还在跑。
+        # 实测（2026-10-31）：厂商重新握手后注入故障，本分支 1 秒内完成
+        # drift -> 判定丢锁 -> re-arm -> 恢复 88%，并在日志里留痕。
+        want="$cur_duty_written"
+        [ -n "$want" ] || [ ! -f "$ENABLED" ] || want=$(cat "$CUR_DUTY" 2>/dev/null)
+        if [ $((n % 6)) -eq 0 ] && [ -n "$want" ]; then
             held=$(get_duty 2)
-            if [ -n "$held" ] && [ "$held" != "$cur_duty_written" ]; then
-                log "drift detected: wanted $cur_duty_written, MCU reports $held, re-asserting"
-                set_duty "$cur_duty_written" >/dev/null 2>&1
+            if [ -n "$held" ] && [ "$held" != "$want" ]; then
+                log "drift: MCU reports duty $held, want $want, re-asserting"
+                if ! set_duty "$want"; then
+                    log "re-assert rejected -> MCU test-mode lock presumed lost, re-arming"
+                    rm -f "$IN_TEST"
+                    if enter_test_mode && set_duty "$want"; then
+                        log "re-armed and duty $want restored"
+                    else
+                        log "ERROR: cannot hold fan duty $want (test mode unavailable)"
+                    fi
+                fi
             fi
         fi
 
@@ -717,17 +886,21 @@ selftest() {
     CT="$TMP/cur_tier"
     TEMP_NODE="$ST"
     CUR_TIER="$CT"
+    CG="$TMP/chg"
+    CHG_TEMP_NODE="$CG"
+    WF="$TMP/wake"
+    WAKE_SRC="$WF"
 
     echo "== [3] 阶梯 + 真实回滞 (T0=$T0 T1=$T1 T2=$T2 T3=$T3 T4=$T4 H=$HYSTERESIS) =="
     echo "prev=IDLE，按温度升序："
-    for x in 36000 40990 41000 46990 47000 49990 50000 52990 53000 55990 56000; do
+    for x in 50000 56990 57000 62990 63000 64990 65000 66990 67000 68990 69000; do
         echo "IDLE" > "$CT"
         printf '%s' "$x" > "$ST"
         printf "  t=%s (%.1fC) -> %s\n" "$x" "$(awk "BEGIN{printf \"%.1f\", $x/1000}")" "$(pick_tier)"
     done
 
-    echo "prev=VERYHOT，检查降档回滞（应停在 52200=53000-$HYSTERESIS 附近）："
-    for x in 52990 52250 52199 50000 49999 49200 49199; do
+    echo "prev=VERYHOT，检查降档回滞（应停在 66200=67000-$HYSTERESIS 附近）："
+    for x in 66990 66250 66199 65000 64999 64200 64199; do
         echo "VERYHOT" > "$CT"
         printf '%s' "$x" > "$ST"
         printf "  t=%s (%.1fC) -> %s\n" "$x" "$(awk "BEGIN{printf \"%.1f\", $x/1000}")" "$(pick_tier)"
@@ -751,7 +924,9 @@ selftest() {
     echo "              FAIL_LOG_EVERY=$FAIL_LOG_EVERY MAX_FAIL_STREAK=$MAX_FAIL_STREAK"
     echo "              HYSTERESIS=$HYSTERESIS (上限=相邻档位最小间隔-1)"
     echo "  阈值单调: T0=$T0 < T1=$T1 < T2=$T2 < T3=$T3 < T4=$T4"
-    echo "  档位 duty: QUIET=$TIER_QUIET IDLE=$TIER_IDLE WARM=$TIER_WARM HOT=$TIER_HOT VERYHOT=$TIER_VERYHOT"
+    echo "  档位 duty: QUIET=$TIER_QUIET IDLE=$TIER_IDLE WARM=$TIER_WARM HOT=$TIER_HOT VERYHOT=$TIER_VERYHOT OVERHEAT=$TIER_OVERHEAT (HANDBACK=$OVERHEAT_HANDBACK)"
+    echo "  充电IC阈值: $CHG0/$CHG1/$CHG2/$CHG3/$CHG4 回滞=$CHG_HYSTERESIS"
+    echo "  熄屏压档: SCREEN_OFF_MAX_RANK=$SCREEN_OFF_MAX_RANK 刷新间隔=$WAKE_DUMP_INTERVAL 圈"
     echo "  非法值会被夹紧/回落并记日志，用 --dumpcfg 看最终生效值。"
 
     echo ""
@@ -761,6 +936,50 @@ selftest() {
         printf "  tier=%-8s -> %s\n" "$x" "$r"
     done
 
+    echo ""
+    echo "== [10] 充电 IC 第二温度源合流（C0=$CHG0 C1=$CHG1 C2=$CHG2 C3=$CHG3 C4=$CHG4）=="
+    echo "  注：charger_temp 节点单位是 0.1C（实测 664 = 66.4C），read_chg_temp 里 *100 换算"
+    echo "IDLE" > "$CT"
+    for pair in "58000 620" "58000 660" "58000 710" "58000 760" "58000 876"; do
+        set -- $pair
+        echo "IDLE" > "$CT"
+        printf '%s' "$1" > "$ST"; printf '%s' "$2" > "$CG"
+        echo "  皮肤 $(($1 / 1000))C + 充电IC $(($2 / 10)).$(($2 % 10))C -> $(pick_tier)"
+    done
+    echo "  期望：IDLE / WARM / HOT / VERYHOT / OVERHEAT"
+    echo "  皮肤不高但充电 IC 87.6C 也必须给满风（实测就是这里把充电砍到 277mA 的）"
+    echo ""
+    echo "  节点读不到 / 返回 -22 时该源自动退出："
+    echo "IDLE" > "$CT"
+    printf '58000' > "$ST"; printf '%s' "-22" > "$CG"
+    echo "  chg=-22 皮肤 58C -> $(pick_tier)（应等同纯皮肤分档 = IDLE）"
+    echo "IDLE" > "$CT"
+    printf '58000' > "$ST"; : > "$CG"
+    echo "  chg=空  皮肤 58C -> $(pick_tier)"
+    : > "$CG"
+    echo ""
+    echo "== [9] 过热档处置（OVERHEAT_HANDBACK=$OVERHEAT_HANDBACK TIER_OVERHEAT=$TIER_OVERHEAT）=="
+    echo "VERYHOT" > "$CT"
+    printf '70000' > "$ST"; printf '4500' > "$CG"
+    echo "  皮肤 70C（充电IC 45.0C，皮肤单独说了算）-> tier=$(pick_tier) duty=$(tier_duty OVERHEAT)"
+    echo "  对比：原厂策略实测 duty 40% / 7790RPM，本模块 88% / 14165RPM"
+    echo ""
+    echo "== [12] 熄屏/睡眠压档（SCREEN_OFF_MAX_RANK=$SCREEN_OFF_MAX_RANK）=="
+    printf '%s' "Awake" > "$WF"
+    for case in "Awake 60000 620" "Asleep 60000 620" "Asleep 66500 720" "Asleep 66500 760" "Asleep 69900 620"; do
+        set -- $case
+        printf '%s' "$1" > "$WF"
+        WAKE_CACHE=""
+        echo "IDLE" > "$CT"
+        printf '%s' "$2" > "$ST"
+        printf '%s' "$3" > "$CG"
+        echo "  wake=$1  皮肤 $(($2 / 1000))C 充电IC $(($3 / 10)).$(($3 % 10))C -> $(pick_tier)"
+    done
+    echo "  期望：IDLE / IDLE(被压) / IDLE(被压) / VERYHOT(充电IC 76C 不压) / OVERHEAT(皮肤 69.9C 不压)"
+    WAKE_CACHE=""; WAKE_SRC=""
+    echo ""
+    echo "== [11] 漂移校验：写入被拒即判定丢锁并重接管（只读，不在此处触发）=="
+    echo "  实测：注入丢锁后 1 秒内 drift -> re-arm -> duty 恢复，见 logcat -s PicoFanTC"
     echo ""
     echo "== [1] 工具失败时的行为约定 =="
     echo "  gd32ipdclient_test 失败仍返回 rc=0，只能匹配 success 字符串 —— 已按此实现"
@@ -773,8 +992,11 @@ selftest() {
 # 保证 status 显示的阈值与 service.sh 实际使用的是同一份，不会出现
 # "配置写错了但 status 还显示错的值" 这种误导。
 dumpcfg() {
-    for _k in TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT \
+    for _k in TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT TIER_OVERHEAT \
+              OVERHEAT_HANDBACK \
               T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE \
+              CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS \
+              SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL \
               RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK \
               RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK; do
         eval "printf '%s=%s\n' \"\$_k\" \"\$$_k\""

@@ -11,3 +11,4 @@
 *.cfg  text eol=lf
 *.prop text eol=lf
 *.md   text eol=lf
+META-INF/** text eol=lf
