@@ -890,6 +890,11 @@ selftest() {
     CHG_TEMP_NODE="$CG"
     WF="$TMP/wake"
     WAKE_SRC="$WF"
+    # 自检必须在"醒着"的假设下跑阶梯，否则 [12] 的熄屏压档会把中间档全压成
+    # IDLE（实测踩到：WAKE_SRC 指向的文件尚未创建时 wake_state 回落到真实设备
+    # 状态，当时设备在睡 -> 除皮肤达到 T4 外全部被压）。
+    printf '%s' "Awake" > "$WF"
+    WAKE_CACHE=""
 
     echo "== [3] 阶梯 + 真实回滞 (T0=$T0 T1=$T1 T2=$T2 T3=$T3 T4=$T4 H=$HYSTERESIS) =="
     echo "prev=IDLE，按温度升序："
@@ -976,7 +981,8 @@ selftest() {
         echo "  wake=$1  皮肤 $(($2 / 1000))C 充电IC $(($3 / 10)).$(($3 % 10))C -> $(pick_tier)"
     done
     echo "  期望：IDLE / IDLE(被压) / IDLE(被压) / VERYHOT(充电IC 76C 不压) / OVERHEAT(皮肤 69.9C 不压)"
-    WAKE_CACHE=""; WAKE_SRC=""
+    printf '%s' "Awake" > "$WF"
+    WAKE_CACHE=""
     echo ""
     echo "== [11] 漂移校验：写入被拒即判定丢锁并重接管（只读，不在此处触发）=="
     echo "  实测：注入丢锁后 1 秒内 drift -> re-arm -> duty 恢复，见 logcat -s PicoFanTC"

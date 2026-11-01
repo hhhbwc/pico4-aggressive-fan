@@ -1,7 +1,7 @@
 id=pico4_fan_tempcontrol
 name=PICO 4 Fan Auto Temp Control (风扇自动温控)
-version=v1.6.0
-versionCode=7
+version=v1.6.1
+versionCode=8
 author=Zubastik
 description=停掉 PICO 原厂风扇策略（负载下锁死在 35%、皮肤 52°C 仍不加风），改为按皮肤温度分档调速。温度源 /sys/class/thermal/thermal_zone86 (skin-msm-therm-usr)。档位：安静 0%（<41°C）/ 空闲 25% / 温热 55% / 较热 65% / 很热 78%，≥69°C 本模块自己吃满风。v1.4.0 修掉：标记文件误判导致模块变僵尸、RPM 升速永久自锁、回滞参数未实现、disable 不持久、过热交回仅维持 5 秒、无超时看门狗、CRLF 致脚本失效。v1.4.0 另修：写入持续失败时无限重试且不交还原厂、卸载后循环仍在跑、配置无校验、RPM-CAP 档位名污染 cur_tier。v1.5.0 实机测试再修：① config.cfg 盲目 source 带来的变量覆盖与任意代码执行（root RCE），改为白名单逐行解析；② 依赖 toybox timeout 的看门狗对脚本型 MCU 工具失效、风扇冻结，改为后台+轮询+进程组强杀。v1.6.0 新增：① 充电 IC NTC 并入温度源（它到 80°C 就把输入砍到 277mA，是「插着却掉电」的直接原因）；② 过热档不再交回原厂（原厂只有 40%）；③ 熄屏/睡眠压档（睡后守护被冻结，风扇会停在上次 duty）；④ 漂移重写失败即判定丢锁并重接管；⑤ 皮肤阈值按本机重标定 57/63/65/67/69。详见 CHANGELOG.md。卸载模块即恢复原厂。
 minMagisk=24000
