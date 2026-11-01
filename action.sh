@@ -261,7 +261,7 @@ status() {
         fi
     elif in_test_mode; then
         if [ -f "$ENABLED" ]; then
-            echo "模式: 本模块温控 (duty 由皮肤温度决定)"
+            echo "模式: 本模块温控 (duty 由「皮肤温度」与「充电 IC NTC」两者较高档决定)"
         else
             echo "模式: MCU test mode 已开，但 service.sh 未运行"
         fi
@@ -305,8 +305,14 @@ restart_service() {
     kill_service
     rm -f "$GAVE_UP" 2>/dev/null
     nohup sh "$SVC" >/dev/null 2>&1 &
-    sleep 3
-    new=$(svc_pid 2>/dev/null)
+    # 守护要等 boot_completed + STARTUP_GRACE 才写 pid 文件，这里最多等 8 秒，
+    # 避免把"还在 grace 期"误报成"重启失败"。
+    new=""
+    for _i in 1 2 3 4 5 6 7 8; do
+        sleep 1
+        new=$(svc_pid 2>/dev/null)
+        [ -n "$new" ] && break
+    done
     if [ -n "$new" ]; then
         echo "已重启 service.sh (PID=$new)，已加载最新 config.cfg"
         return 0
