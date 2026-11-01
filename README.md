@@ -4,11 +4,11 @@
 
 ---
 
-A Magisk module that replaces PICO 4's stock fan curve with a skin-temperature stepped curve, one tier higher. Uses GD32 MCU test mode to bypass the stock 35% duty lock — the vendor service (`pxrfanservice`) stays running untouched.
+A Magisk module that replaces PICO 4's stock fan curve with a skin-temperature stepped curve, one tier higher. Uses GD32 MCU test mode to bypass the stock 35–40% duty lock — the vendor service (`pxrfanservice`) stays running untouched.
 
-> **v1.5.0** is the current release. It builds on the v1.3.0 / v1.4.0 fixes (stale test-mode flag, RPM escalation deadlock, hysteresis, persistent `disable`, CRLF-safety, timeout watchdog, config validation) and adds real-device hardening: `config.cfg` is now parsed through a whitelist instead of being `source`d (closes a variable-override + root-RCE hole), and the watchdog no longer relies on toybox `timeout` (which cannot kill script-type MCU tools, freezing the fan). Details and measured evidence: [CHANGELOG.md](CHANGELOG.md).
+> **v1.6.0** is the current release. It adds a second temperature source (the charger IC NTC), retunes the skin thresholds for this unit (57/63/65/67/69 °C), stops handing the overheat tier back to the vendor (stock only holds 40%), clamps the fan while the headset is asleep, and re-arms automatically if the MCU test-mode lock is lost. It builds on the v1.3.0–v1.5.0 fixes (test-mode flag, RPM deadlock, hysteresis, persistent `disable`, CRLF safety, timeout watchdog, config validation, root-RCE fix). Details and measured evidence: [CHANGELOG.md](CHANGELOG.md).
 >
-> If you are upgrading from v1.2.0, re-check `config.cfg`: the shipped `T0` (38000 → 41000) and `TIER_IDLE` (45 → 25) changed, and four new keys were added. Your existing file is read as-is, so delete it to pick up the new defaults.
+> If you are upgrading from an older version, re-check `config.cfg`: the shipped thresholds and tier duties changed, and v1.6.0 adds `TIER_OVERHEAT`, `OVERHEAT_HANDBACK`, `CHG0..CHG4`, `CHG_HYSTERESIS`, `SCREEN_OFF_MAX_RANK`, `WAKE_DUMP_INTERVAL`. Your existing file is read as-is, so delete it to pick up the new defaults.
 
 **核心机制**: `setfantestmode 1` puts the GD32 MCU into test mode, where it rejects the vendor's `SetFanSpeed` frames at the firmware level. The vendor keeps running its temperature sampling and state machine — only its duty writes stop reaching the motor.
 
@@ -244,9 +244,9 @@ PICO 4 的风扇不是由骁龙 865 直接控制的。链路是：
 | 空闲 | 30–40% | ~7050 | ~52°C |
 | 满负载（12 进程压 5 分钟） | 30→35% 后**锁死** | ~6200 | 45.7°C → 51.8°C 一路涨 |
 
-负载下风扇升到 35% 就不再加了，皮肤温度一路涨到 51.8°C 都不响应。
+负载下风扇升到 35% 就不再加了，皮肤温度一路涨到 51.8°C 都不响应。v1.6 复测原厂稳态锁在 duty 40% / ~7790 RPM（另一次 35% / 6989 RPM）——**仍比本模块任何一档都弱**。
 
-本模块替换 vendor 的策略，自己按皮肤温度分档，整体高一档。
+本模块替换 vendor 的策略，自己按「皮肤温度」和「充电 IC 温度」两路分档，取较高档执行。
 
 ### 核心机制：MCU 测试模式
 
@@ -268,18 +268,40 @@ gd32ipdservice: L1:retry_cnt=3 ret=4      ← MCU 拒收
 
 退出测试模式不会立刻解锁——MCU 还要等 vendor 重新握手一次（`79 00 00 00 28 23 00 00 01 73` 被接受，`ret=10`）才恢复接收 duty 帧。所以退出路径会重启 `pxrfanservice` 触发这次握手。
 
+v1.6.0 起每轮还会用 `getfaninfo` 对照实际 duty。一旦发现被原厂夺回（drift），模块会立刻重下发并重建 test mode；实测注入丢锁后 **15 秒内**恢复（duty 40→88、RPM ~7791→14035）。`state/cur_duty` 只代表模块最后一次写入的意图，验收要看 `getfaninfo`。
+
 ### 温控档位
 
-温度源：`/sys/class/thermal/thermal_zone86/temp`（skin-msm-therm-usr，单位毫摄氏度）
+v1.6.0 起有两路温度源，最终档位取两者中较高的那个：
+
+| 温度源 | 节点 | 说明 |
+|---|---|---|
+| 皮肤 | `/sys/class/thermal/thermal_zone86/temp` | skin-msm-therm-usr，单位毫摄氏度；这是**虚拟模型量**，不是真实皮温 |
+| 充电 IC | `/sys/class/power_supply/battery/charger_temp` | NTC，单位 0.1°C；越过 80°C 驱动会把输入砍到 277mA，是「插着电却掉电」的直接原因 |
+
+皮肤温度档（v1.6.0 按本机重标定）：
 
 | 皮肤温度 | 档位 | duty | 实测 RPM |
 |---|---|---|---|
-| < 41°C | 安静 | 0% | 0 |
-| 41–47°C | 空闲 | 25% | 4346 |
-| 47–50°C | 温热 | 55% | ~9000 |
-| 50–53°C | 较热 | 65% | ~10600 |
-| 53–56°C | 很热 | 78% | 12220 |
-| ≥ 56°C | **交回原厂策略** | 由原厂决定 | |
+| < 57°C | 安静 | 0% | 0 |
+| 57–63°C | 空闲 | 25% | 4346–5036 |
+| 63–65°C | 温热 | 55% | 7548–9766 |
+| 65–67°C | 较热 | 65% | 10600–11072 |
+| 67–69°C | 很热 | 78% | 12220 |
+| ≥ 69°C | 过热 | 88% | 13671–14165 |
+
+充电 IC 档（`CHG0..CHG4`，默认 60/65/70/75/79°C）：
+
+| 充电 IC 温度 | 对应档位 |
+|---|---|
+| < 60°C | 安静 |
+| 60–65°C | 空闲 |
+| 65–70°C | 温热 |
+| 70–75°C | 较热 |
+| 75–79°C | 很热 |
+| ≥ 79°C | 过热 |
+
+降档时两路都要凉下来：皮肤需低于「档位阈值 − `HYSTERESIS`」（默认 0.8°C），充电 IC 需低于「阈值 − `CHG_HYSTERESIS`」（默认 1.5°C）。充电 IC 节点读不到或返回 `-22` 时，这一路自动退出，退回纯皮肤分档。
 
 PICO A8110 实测 duty → RPM 曲线：
 
@@ -287,19 +309,19 @@ PICO A8110 实测 duty → RPM 曲线：
 |---|---|---|---|---|---|---|---|---|---|---|
 | RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-约 3450 RPM 是风扇真正能转起来的最低转速，所以 15% 以下基本等同于停转。
+约 3450 RPM 是风扇真正能转起来的最低转速，所以 15% 以下基本等同于停转。**88% 是实测的转速最高点**：duty 100% 在部分机器上只有约 12500 RPM，而且超过 ~85% 噪音明显上升。
 
-**为什么 T0 是 41°C 而不是 38°C**：PICO 4 息屏静置的皮肤温度实测就在 37.5–40°C。阈值定在 38°C 正好压在待机温度上，而第一档又是 45%（约 7500 RPM），于是出现 0 ↔ 7500 RPM 的反复起跳——一台没人用的设备，风扇每隔几分钟就自己转起来又停下。
+**为什么阈值是 57/63/65/67/69°C**：`zone86` 是虚拟模型量，本机只要醒着 SoC 就 63–76°C、卸下也在 57–61°C。旧的 41/47/50/53/56 等于「醒着 = 过热」，风扇从早到晚贴 88%——这就是「熄屏了风扇还很吵」的直接原因。新阈值按本机实测重标定；充电安全不再依赖这组值，而是由 `charger_temp` 那一路兜底。
 
-安静档对应厂商在 36°C 左右自动停风扇的行为。
+**过热档不再交回原厂（v1.6.0 默认）**：原厂稳态只有 duty 40% / ~7790 RPM，越热越交给一个更不制风的策略是反效果。所以 ≥69°C 时本模块自己吃 88%。想恢复旧行为把 `OVERHEAT_HANDBACK` 设为 `1`，交回后要等皮肤落回 `OVERHEAT_RELEASE_RANK`（默认 3 = 较热）才重新接管。
 
-最后一档故意把控制权还给原厂：温度真的过高时，退出测试模式、重启 vendor 服务、恢复原厂保护逻辑，比本模块死守一个 duty 安全。控制权要等皮肤落回「较热」档（`OVERHEAT_RELEASE_RANK`，默认 3）才重新接管——交回 5 秒就抢回来等于没交回。
+**滞回**：档位向上跨阈值直接升档，向下则需要跌破 `阈值 − HYSTERESIS` 才降档（v1.2.0 里这段描述只写在文档里，代码除安静档外根本没实现，这个参数实际上不起作用）。
 
-**滞回**：档位向上跨阈值直接升档，向下则需要皮肤温度跌破 `阈值 − HYSTERESIS` 才降档。默认 HYSTERESIS=800 mC（0.8°C）。（v1.2.0 里这段描述只写在文档里，代码除安静档外根本没实现，这个参数实际上不起作用。）
+**RPM 上限（带温度闸门）**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000）**且**当前温度档位不低于 `RPM_RELEASE_RANK`（默认 3 = 较热，即皮肤 ≥ 65°C 或充电 IC ≥ 70°C），下一循环才把 duty 提到 `RPM_DUTY`（默认 88%）。
 
-**RPM 上限（带温度闸门）**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000）**且**当前温度档位不低于 `RPM_RELEASE_RANK`（默认 3 = 较热，即皮肤 ≥ 50°C），下一循环才把 duty 提到 `RPM_DUTY`（默认 88%）。
+这道温度闸门是安全的关键。没有它，这条规则会永久自锁，而且是那种"读代码时看不出问题"的锁：rpm ≥ 12000 → duty 设为 88%；而在 88% 下风扇上报的 rpm 又 ≥ 12000 → 条件永远成立，同时温度表被完全旁路。唯一的出路是把 duty 降下来，而这又要求 rpm 已经低于阈值——逻辑死锁。实测 duty 88% 时 rpm 真的会到 13671，所以这在日常使用中就能触发，触发后风扇会一直接近满速转下去直到重启。加了闸门之后，温度一回落转速就降下来。
 
-这道温度闸门是安全的关键。没有它，这条规则会永久自锁，而且是那种"读代码时看不出问题"的锁：rpm ≥ 12000 → duty 设为 88%；而在 88% 下风扇上报的 rpm 又 ≥ 12000 → 条件永远成立，同时温度表被完全旁路。唯一的出路是把 duty 降下来，而这又要求 rpm 已经低于阈值——逻辑死锁。实测 duty 88% 时 rpm 真的会到 13671，所以这在日常使用中就能触发，触发后风扇会一直接近满速转下去直到重启。加了闸门之后，皮肤一回到 50°C 以下转速就降下来。
+**熄屏/睡眠压档（v1.6.0）**：设备睡过去后守护会被内核冻结，风扇停在上次写入的 duty 上（睡前 88% → 整晚 88%）。所以检测到 `mWakefulness` 不是 `Awake` 时，档位压到 `SCREEN_OFF_MAX_RANK`（默认 1 = 空闲 25%）；例外是真烫——充电 IC ≥ 75°C 或皮肤 ≥ 69°C 时不压。`mWakefulness` 每 6 个循环（约 30 秒）刷新一次。实测负载 65% → 熄屏 45 秒内降到 25% / ~4980 RPM。
 
 ### 调整
 
@@ -312,11 +334,15 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 # 或重启模块/设备。
 ```
 
-默认 `config.cfg`（即出厂值）：
+默认 `config.cfg`（即出厂值，v1.6.0）：
 
 ```
 TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+TIER_OVERHEAT=88
+OVERHEAT_HANDBACK=0
+T0=57000  T1=63000  T2=65000  T3=67000  T4=69000
+CHG0=60000  CHG1=65000  CHG2=70000  CHG3=75000  CHG4=79000
+CHG_HYSTERESIS=1500
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -326,9 +352,12 @@ RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
 RETRY_BACKOFF=3
 FAIL_LOG_EVERY=12
+MAX_FAIL_STREAK=10
+SCREEN_OFF_MAX_RANK=1
+WAKE_DUMP_INTERVAL=6
 ```
 
-读取时会先去掉 CR，所以用 Windows 记事本编辑存成 CRLF 也没问题。没写的键回落到内置默认值。
+读取时会先去掉 CR，所以用 Windows 记事本编辑存成 CRLF 也没问题。v1.6.0 起支持行尾注释（`TIER_IDLE=25   # 说明` 会先剥掉 `#` 之后再校验）。没写的键回落到内置默认值。
 
 ### 使用方法
 
@@ -337,16 +366,16 @@ FAIL_LOG_EVERY=12
 手动控制（Magisk 管理器的「操作」按钮，或直接进 shell）：
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # 打印 duty/rpm/温度/档位 + 档位表
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # 皮肤温度、duty/rpm、档位、熄屏状态、上次成功写入
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # 让 service.sh 按温度控风扇
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # 恢复原厂策略
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # 固定 70%，直到 disable 或 restart
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # 走档：安静->空闲->温热->较热->很热->安静
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # 走档：安静->空闲->温热->较热->很热->过热->安静
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # 重载 config.cfg（杀 service.sh 重启）
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # 纯逻辑自检，只读
 ```
 
-开关状态会写入 `state/enabled`，重启后按上次选择恢复。
+开关状态持久化：`state/enabled` 表示模块在控温，`state/disabled` 表示你手动关过——重启后不会偷偷接管。`disable` 会交还原厂并让正在跑的循环自行退出。
 
 恢复出厂行为：禁用或卸载模块即可，`stop.sh` 会自动退出测试模式、重启 vendor 服务，把风扇还给原厂。
 
@@ -354,24 +383,32 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # 纯逻�
 
 ```sh
 su -c '/system/bin/gd32ipdclient_test getfaninfo'
-# duty=55 rpm=8530 rpm_target=9000 mode=duty mode
+# duty=88 rpm=14035 mode=duty mode
 ```
 
-### 新增参数（v1.3.0）
+`getfaninfo` 是地面真值，`state/cur_duty` 只是模块的写入意图。注意：`gd32ipdclient_test` **失败时退出码依然是 0**，只会打印 `setfantestspeed N failed` / `=== operation failed! ===`，所以判成败要看输出里有没有 `success`，不能看 `$?`。
 
-除档位表之外，`config.cfg` 里还有几个 v1.2.0 没有的开关：
+### 新增参数（v1.3.0～v1.6.0）
+
+除档位表之外，`config.cfg` 里还有这些开关：
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `RPM_RELEASE_RANK` | 3 | 允许 RPM 升速规则生效所需的最低温度档位（`0` 安静 … `4` 很热）。`3` = 只有皮肤 ≥ 50°C 才升速。调大更安静，调小余量更多。 |
-| `OVERHEAT_RELEASE_RANK` | 3 | 过热交回原厂后，皮肤要降回该档才重新接管。 |
+| `RPM_RELEASE_RANK` | 3 | 允许 RPM 升速规则生效所需的最低温度档位（`0` 安静 … `5` 过热）。`3` = 较热档，即皮肤 ≥ 65°C 或充电 IC ≥ 70°C。调大更安静，调小余量更多。 |
+| `OVERHEAT_RELEASE_RANK` | 3 | 仅当 `OVERHEAT_HANDBACK=1` 时生效：交回原厂后，皮肤要降回该档才重新接管。 |
 | `RETRY_BACKOFF` | 3 | 风扇写入被拒后，下次重试前等待的秒数。 |
 | `FAIL_LOG_EVERY` | 12 | 日志节流：连续 N 次失败只记 1 条（第 1 次总是记）。 |
 | `MAX_FAIL_STREAK` | 10 | **v1.4.0。** 连续 N 次写入被拒后放弃控制：退出 test mode、交还原厂、写 `state/gave_up`。没有这个上限时，工具一旦持续失败，MCU 会一直卡在 test mode，原厂的 duty 帧同样被拒，**风扇没人管**，而 state 文件还写着"本模块温控"。 |
+| `TIER_OVERHEAT` | 88 | **v1.6.0。** 过热档 duty。88% 实测 13671–14165 RPM；100% 在部分机器上反而只有 ~12500 RPM。 |
+| `OVERHEAT_HANDBACK` | 0 | **v1.6.0。** `0` = 过热档自己吃 `TIER_OVERHEAT`；`1` = 恢复旧行为，交回原厂策略。 |
+| `CHG0..CHG4` | 60000/65000/70000/75000/79000 | **v1.6.0。** 充电 IC 第二温度源的档位阈值（毫摄氏度），必须严格递增。 |
+| `CHG_HYSTERESIS` | 1500 | **v1.6.0。** 充电 IC 这一路的降档回滞（1.5°C）。 |
+| `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0。** 非 Awake 时的档位上限（0=安静 1=空闲 … 5=过热）。`-1` 关闭熄屏压档。真烫时（充电 IC ≥ 75°C 或皮肤 ≥ 69°C）豁免。 |
+| `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0。** 每 N 个循环（× `LOOP_INTERVAL`）刷新一次 `mWakefulness`。 |
 
-想让过热档固定成 90% 而不是交回原厂，把 `main` 循环过热分支里的 `exit_test_mode` 换成 `set_duty 90`，并去掉那里的 `IN_TEST` 相关处理——但这样一来你就失去了原厂自己的高温保护。
+过热档的处置由 `OVERHEAT_HANDBACK` 决定：默认 `0` 时模块自己吃 `TIER_OVERHEAT=88%`；设为 `1` 才恢复「交还原厂」。原厂稳态只有 duty 40% / ~7790 RPM，交回通常等于降速，只有更信任原厂保护逻辑时才建议打开。想改顶格转速直接改 `TIER_OVERHEAT`（模块支持 0–100，但 88% 通常是实测最高点）。
 
-### 配置校验（v1.4.0）
+### 配置校验（v1.5.0 起）
 
 `config.cfg` 从 v1.5.0 起改为**白名单逐行解析**：每行按 `KEY=VALUE` 拆，只接受已知的数值键，
 且拒绝一切含命令替换（`$( )`、反引号）、`;` 或 `&` 的值。这堵上了原先 `source` 带来的口子——
@@ -387,19 +424,23 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 ```
 
+v1.6.0 还修了一个**静默失效**：旧解析器不剥行尾注释，`KEY=25   # 说明` 会被整行判非法并回落默认值（实测一次刷出 14 条「非法，回落到」）。现在会先剥注释再校验。另外 `CHG0..CHG4` 必须严格递增，`SCREEN_OFF_MAX_RANK` 会被夹紧到 `-1..5`。
+
 ### 自检
 
 ```sh
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-把档位阶梯、滞回和 RPM 闸门当作纯逻辑在临时状态目录里跑一遍。不碰风扇、不碰真实温度节点，任何时候都能跑。想确认某份 `config.cfg` 到底会怎么动作，先跑它。`action.sh selftest` 是同一个东西的简写。
+把档位阶梯、滞回、双温度源合流、熄屏压档和 RPM 闸门当作纯逻辑在临时状态目录里跑一遍。不碰风扇、不碰真实温度节点，任何时候都能跑。想确认某份 `config.cfg` 到底会怎么动作，先跑它。`action.sh selftest` 是同一个东西的简写。
+
+自检必须在设备上（或 WSL）跑：Git Bash 没有 `/data`，`mkdir /data/local/tmp/...` 会失败并静默退出，看起来像脚本挂了。
 
 ### 注意事项
 
 1. **需要 root**。`gd32ipdclient_test` 走的是 root-only 的 binder 服务，普通 shell 调不动。
 2. **非官方方案**。走的是出厂测试程序 `gd32ipdclient_test`，PICO 没暴露公开接口。理论上固件升级后路径或参数可能变。脚本对工具缺失和温度节点缺失有降级处理，但不会强行锁住风扇——拿不到控制权就退出，让原厂接手。
-3. **vendor 服务始终运行**，不会被杀掉。它的高温保护逻辑在过热档会重新生效。日常温度下你只会更凉快。
+3. **vendor 服务始终运行**，不会被杀掉。它的温度采样和状态机照常工作，只是 duty 下发到不了电机。v1.6.0 默认**不会**在过热档把控制权还给它（原厂只有 40% / ~7790 RPM）；`OVERHEAT_HANDBACK=1` 时才恢复原厂高温保护。
 4. **风扇转速上限**：duty 88% 实测 13671 RPM；duty=100% 约 12500 RPM。duty 超过 ~85% 噪音明显上升。
 5. **卸载即恢复**。不用手动清理，`stop.sh` 会退出测试模式、**杀掉还在跑的 `service.sh` 循环**（v1.4.0：这一步是关键，活着的循环发现 `in_test` 没了会立刻重新抢回 test mode，这正是"模块卸了风扇却停在某个转速、只能重启"的原因），再重新拉起 vendor 服务。
 6. **重启后自动接管**，除非你用 `action.sh disable` 关过——那条命令会写 `state/disabled`，重启也会保持关闭。
@@ -407,6 +448,9 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 8. **模块"安静"才是正常**。控制循环只在状态变化时记日志，所以日志少是好事。如果日志被失败信息刷满，跑 `action.sh status` 和 `service.sh --selftest`——它们会告诉你模块到底有没有真正握住 MCU 的测试模式，而不是假设它握着。
 9. **`status` 会打印"上次成功写风扇: N 秒前"**（v1.4.0）。排查时最有用的一行：一个在跑但几分钟没成功写过的模块，其余 state 文件再好看也没有真正的控制权。
 10. **同一时刻只会有一个 `service.sh`**（v1.4.0）。它把 pid 写进 `state/service.pid`，发现上一个还活着就自己退出——单靠 `pgrep`/`pkill` 不够可靠，两个循环抢写 duty 是真实的故障模式。
+11. **熄屏不等于停转**（v1.6.0）。设备睡过去后守护进程会被内核冻结，风扇会停在上次写入的 duty 上。模块检测到非 `Awake` 就把档位压到 `SCREEN_OFF_MAX_RANK`（默认 IDLE 25%），真烫时豁免。手动 `action.sh set` 固定 duty 时会停掉 `service.sh`，这种模式下不受熄屏压档影响。
+12. **充电 IC 是第二温度源**（v1.6.0）。`/sys/class/power_supply/battery/charger_temp` 的单位是 0.1°C；`charger_temp_max=800` 即 80°C，越过它驱动会把输入砍到 277mA——这就是「插着电却掉电」的直接原因。`pm8150b_tz` 虽然也报温度，但没绑定任何 cooling device，热框架无法处置，只能由模块自己读 NTC 并加风/降档。
+13. **`gd32ipdclient_test` 失败也返回 0**。判成败只能匹配输出里的 `success`；对端可能卡死，手工调用时套一层 `timeout`。模块内部已经用后台 + 轮询 + 进程组强杀处理这一点。
 
 ### 文件清单
 
@@ -418,12 +462,14 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 | `stop.sh` | 卸载时退出测试模式、恢复原厂策略 |
 | `action.sh` | 手动开关 / 状态查询 / 自检 |
 | `config.cfg` | 阈值与各档 duty |
-| `CHANGELOG.md` | 版本历史与 v1.3.0 修复说明 |
-| `.gitattributes` | 强制脚本与配置使用 LF |
+| `META-INF/` | Magisk 安装脚本；release 里的 zip 可直接刷入 |
+| `CHANGELOG.md` | 版本历史与各版修复说明 |
+| `notes.md` | 发布说明与升级提示 |
+| `.gitattributes` | 强制脚本、配置与安装脚本使用 LF |
 
 ### 致谢
 
-核心锁定机制（`setfantestmode`）是通过 [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl) 发现的。该项目只做手动调速（最低 50%、无温度反馈、不处理解锁路径）。本模块增加了皮肤温度分档控制、0–100% 全范围、过热交回、以及通过 Magisk 开机自动接管。
+核心锁定机制（`setfantestmode`）是通过 [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl) 发现的。该项目只做手动调速（最低 50%、无温度反馈、不处理解锁路径）。本模块增加了皮肤温度分档控制、充电 IC 第二温度源、0–100% 全范围、熄屏压档、丢锁自动重抢、以及通过 Magisk 开机自动接管。
 
 ---
 
