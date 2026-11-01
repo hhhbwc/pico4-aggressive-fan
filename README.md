@@ -34,9 +34,9 @@ The stock `pxrfanservice` policy is very conservative (measured on the author's 
 | Idle | 30–40% | ~7050 | ~52°C |
 | Heavy load (12 procs, 5 min) | 30→35% then **locked** | ~6200 | 45.7°C → 51.8°C, keeps rising |
 
-Under load the fan climbs to 35% and stops. Skin temperature climbs to 51.8°C and the fan does not respond.
+Under load the fan climbs to 35% and stops. Skin temperature climbs to 51.8°C and the fan does not respond. A v1.6 re-measurement showed the stock policy settling at duty 40% / ~7790 RPM (another run: 35% / 6989 RPM) — **still weaker than every tier in this module**.
 
-This module replaces that policy with a stepped curve, one tier above stock.
+This module replaces that policy with a stepped curve driven by **both skin temperature and charger-IC temperature**, whichever is higher.
 
 ### Core mechanism: MCU test mode
 
@@ -58,18 +58,40 @@ The duty written by `setfantestspeed` is unaffected. This means **`pxrfanservice
 
 Exiting test mode does not unlock immediately — the MCU still waits for the vendor to re-handshake (`79 00 00 00 28 23 00 00 01 73` accepted, `ret=10`) before accepting duty frames again. So the exit path restarts `pxrfanservice` to trigger that handshake.
 
+Since v1.6.0 each loop also compares the requested duty with `getfaninfo`. If the vendor has taken the fan back (drift), the module re-sends the duty and rebuilds test mode immediately; in a fault-injection test it recovered **within 15 seconds** (duty 40→88, rpm ~7791→14035). `state/cur_duty` only records the module's last intent — always verify with `getfaninfo`.
+
 ### Fan tiers
 
-Temperature source: `/sys/class/thermal/thermal_zone86/temp` (skin-msm-therm-usr, millidegrees C)
+Since v1.6.0 there are two temperature sources; the active tier is the higher of the two:
+
+| Source | Node | Notes |
+|---|---|---|
+| Skin | `/sys/class/thermal/thermal_zone86/temp` | skin-msm-therm-usr, millidegrees C; a **virtual model value**, not real skin temperature |
+| Charger IC | `/sys/class/power_supply/battery/charger_temp` | NTC, 0.1°C units; above 80°C the driver cuts input to 277mA — the direct cause of "plugged in but losing charge" |
+
+Skin-temperature tiers (retuned for this unit in v1.6.0):
 
 | Skin temp | tier | duty | Measured RPM |
 |---|---|---|---|
-| < 41°C | quiet | 0% | 0 |
-| 41–47°C | idle | 25% | 4346 |
-| 47–50°C | warm | 55% | ~9000 |
-| 50–53°C | hot | 65% | ~10600 |
-| 53–56°C | very hot | 78% | 12220 |
-| ≥ 56°C | **hand back to stock policy** | vendor decides | |
+| < 57°C | quiet | 0% | 0 |
+| 57–63°C | idle | 25% | 4346–5036 |
+| 63–65°C | warm | 55% | 7548–9766 |
+| 65–67°C | hot | 65% | 10600–11072 |
+| 67–69°C | very hot | 78% | 12220 |
+| ≥ 69°C | overheat | 88% | 13671–14165 |
+
+Charger-IC tiers (`CHG0..CHG4`, default 60/65/70/75/79°C):
+
+| Charger IC temp | Tier |
+|---|---|
+| < 60°C | quiet |
+| 60–65°C | idle |
+| 65–70°C | warm |
+| 70–75°C | hot |
+| 75–79°C | very hot |
+| ≥ 79°C | overheat |
+
+Downshifting requires both sources to be cool: skin below `threshold − HYSTERESIS` (default 0.8°C) and charger IC below `threshold − CHG_HYSTERESIS` (default 1.5°C). If the charger node is missing or returns `-22`, that source drops out and control falls back to skin only.
 
 Measured duty → RPM curve on a PICO A8110:
 
@@ -77,19 +99,19 @@ Measured duty → RPM curve on a PICO A8110:
 |---|---|---|---|---|---|---|---|---|---|---|
 | RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-About 3450 RPM is the slowest the fan will actually turn, so any duty under ~15% is effectively "off".
+About 3450 RPM is the slowest the fan will actually turn, so any duty under ~15% is effectively "off". **88% is the measured peak**: duty 100% gives only about 12500 RPM on some units, and noise rises noticeably above ~85%.
 
-**Why `T0` is 41°C and not 38°C.** A PICO 4 sitting idle with the screen off measures 37.5–40°C skin. A 38°C threshold therefore sits directly on the idle temperature, and with a first tier of 45% (~7500 RPM) that produced a 0 ↔ 7500 RPM flap: the fan audibly spinning up and stopping again every few minutes on a headset nobody was using.
+**Why the thresholds are 57/63/65/67/69°C.** `zone86` is a virtual model value: on this unit an awake SoC sits at 63–76°C, and even off the head it reads 57–61°C. The old 41/47/50/53/56 thresholds meant "awake = overheat", so the fan sat at 88% all day — the direct cause of "it is still loud after the screen turns off". The new thresholds are calibrated on this unit; charging safety no longer depends on them and is covered by the `charger_temp` source instead.
 
-The quiet tier matches what the vendor itself does around 36°C (drops the fan to 0).
+**The overheat tier no longer hands back to the vendor (v1.6.0 default).** Stock steady state is only duty 40% / ~7790 RPM, so handing control to a weaker policy as things get hotter is counterproductive. At ≥69°C the module now holds 88% itself. To restore the old behaviour set `OVERHEAT_HANDBACK=1`; control is then retaken only once skin falls back to `OVERHEAT_RELEASE_RANK` (default 3 = hot).
 
-The last tier deliberately hands control back to the stock firmware: when it gets genuinely hot, exiting test mode, restarting the vendor service, and restoring its thermal-protection logic is safer than this module holding a fixed duty. Control is taken back only once the skin has fallen to the `HOT` tier again (`OVERHEAT_RELEASE_RANK`, default 3) — releasing it and immediately re-grabbing it five seconds later would defeat the whole point.
+**Hysteresis**: tiers move up the moment a threshold is crossed, but move down only once the source has fallen below `threshold − HYSTERESIS`. (In v1.2.0 this was documented but not actually implemented outside the quiet tier — the parameter had no effect.)
 
-**Hysteresis**: tiers move up the moment a threshold is crossed, but move down only once the skin has fallen below `threshold − HYSTERESIS` (default 800 mC = 0.8°C). A wobble at a boundary therefore does not ping-pong the fan every loop. (In v1.2.0 this was documented but not actually implemented outside the quiet tier — the parameter had no effect.)
+**RPM cap, temperature-gated**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000) **and** the temperature tier is at least `RPM_RELEASE_RANK` (default 3 = hot, i.e. skin ≥ 65°C or charger IC ≥ 70°C), the next loop raises duty to `RPM_DUTY` (default 88%).
 
-**RPM cap, temperature-gated**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000) **and** the temperature tier is at least `RPM_RELEASE_RANK` (default 3 = hot, i.e. skin ≥ 50°C), the next loop raises duty to `RPM_DUTY` (default 88%).
+The temperature gate is what keeps this safe. Without it the rule latches permanently, and it does so in a way that looks fine in a code read: rpm ≥ 12000 sets duty to 88%; at duty 88% the fan reports ≥ 12000 rpm; so the condition is true again forever — and it bypasses the temperature table entirely. The only way out would be a lower duty, which requires rpm to already be under the cap. Measured rpm really does reach 13671 at duty 88%, so this was reachable in ordinary use and the fan would sit near full speed at idle until reboot. With the gate it drops back as soon as the temperature falls.
 
-The temperature gate is what keeps this safe. Without it the rule latches permanently, and it does so in a way that looks fine in a code read: rpm ≥ 12000 sets duty to 88%; at duty 88% the fan reports ≥ 12000 rpm; so the condition is true again forever — and it bypasses the temperature table entirely. The only way out would be a lower duty, which requires rpm to already be under the cap. Measured rpm really does reach 13671 at duty 88%, so this was reachable in ordinary use and the fan would sit near full speed at idle until reboot. With the gate it drops back as soon as the skin returns below 50°C.
+**Screen-off/sleep clamp (v1.6.0)**: once the device sleeps, the daemon is frozen by the kernel and the fan stays at the last duty written (88% before bed → 88% all night). So when `mWakefulness` is not `Awake`, the tier is clamped to `SCREEN_OFF_MAX_RANK` (default 1 = idle 25%), except when genuinely hot — charger IC ≥ 75°C or skin ≥ 69°C. `mWakefulness` is refreshed every 6 loops (~30 s). Measured: 65% under load → 25% / ~4980 RPM within 45 seconds of screen-off.
 
 ### Tuning
 
@@ -102,11 +124,15 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 # Or reboot the module (or the device).
 ```
 
-Example `config.cfg` (the shipped default):
+Example `config.cfg` (the shipped default, v1.6.0):
 
 ```
 TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+TIER_OVERHEAT=88
+OVERHEAT_HANDBACK=0
+T0=57000  T1=63000  T2=65000  T3=67000  T4=69000
+CHG0=60000  CHG1=65000  CHG2=70000  CHG3=75000  CHG4=79000
+CHG_HYSTERESIS=1500
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -116,9 +142,12 @@ RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
 RETRY_BACKOFF=3
 FAIL_LOG_EVERY=12
+MAX_FAIL_STREAK=10
+SCREEN_OFF_MAX_RANK=1
+WAKE_DUMP_INTERVAL=6
 ```
 
-The file is read with CR stripped, so saving it with a Windows editor (Notepad etc.) that writes CRLF is safe. Keys you leave out fall back to the built-in defaults.
+The file is read with CR stripped, so saving it with a Windows editor (Notepad etc.) that writes CRLF is safe. Since v1.6.0 inline comments work too (`TIER_IDLE=25   # note` is stripped before validation). Keys you leave out fall back to the built-in defaults.
 
 ### Usage
 
@@ -127,16 +156,16 @@ After install, the module takes over the fan automatically on boot.
 Manual control (Magisk Manager "Action" button, or from shell):
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # print duty/rpm/temp/tier + tier table
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # skin temp, duty/rpm, tier, sleep state, last successful write
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # let service.sh drive the fan by temperature
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # restore stock policy
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # pin fan to a fixed 70% until disable/restart
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # walk QUIET->IDLE->WARM->HOT->VERYHOT->QUIET
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # walk quiet->idle->warm->hot->very hot->overheat->quiet
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # reload config.cfg (kill + respawn service.sh)
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # pure-logic check, read-only
 ```
 
-The switch state survives reboot (v1.3.0): `state/enabled` means "the module is driving the fan", `state/disabled` means "the user turned it off" — after a `disable` the module will not quietly take over again at boot. `disable` also hands the fan back to the vendor and the running control loop exits by itself.
+The switch state is persistent: `state/enabled` means "the module is driving the fan", `state/disabled` means "the user turned it off" — after a `disable` the module will not quietly take over again at boot. `disable` also hands the fan back to the vendor and the running control loop exits by itself.
 
 To restore stock behaviour: disable or uninstall the module. `stop.sh` exits test mode, restarts the vendor service, and returns the fan to stock control.
 
@@ -144,24 +173,32 @@ To restore stock behaviour: disable or uninstall the module. `stop.sh` exits tes
 
 ```sh
 su -c '/system/bin/gd32ipdclient_test getfaninfo'
-# duty=55 rpm=8530 rpm_target=9000 mode=duty mode
+# duty=88 rpm=14035 mode=duty mode
 ```
 
-### Extended keys (v1.3.0)
+`getfaninfo` is ground truth; `state/cur_duty` is only the module's write intent. Note that `gd32ipdclient_test` **still exits 0 on failure** — it only prints `setfantestspeed N failed` / `=== operation failed! ===`. Judge success by `success` in the output, never by `$?`.
 
-Beyond the tier table, `config.cfg` carries a few knobs that did not exist in v1.2.0:
+### Extended keys (v1.3.0–v1.6.0)
+
+Beyond the tier table, `config.cfg` carries these knobs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `RPM_RELEASE_RANK` | 3 | Temperature tier (`0` quiet … `4` very hot) required before the RPM-cap rule may raise duty. `3` = only at skin ≥ 50°C. Raise it to keep the fan quieter, lower it for more headroom. |
-| `OVERHEAT_RELEASE_RANK` | 3 | Temperature tier the skin must fall back to before the module retakes control after an overheat handback. |
+| `RPM_RELEASE_RANK` | 3 | Temperature tier (`0` quiet … `5` overheat) required before the RPM-cap rule may raise duty. `3` = hot, i.e. skin ≥ 65°C or charger IC ≥ 70°C. Raise it to keep the fan quieter, lower it for more headroom. |
+| `OVERHEAT_RELEASE_RANK` | 3 | Only used when `OVERHEAT_HANDBACK=1`: the tier the skin must fall back to before the module retakes control after an overheat handback. |
 | `RETRY_BACKOFF` | 3 | Seconds to wait after a rejected fan write before trying again. |
 | `FAIL_LOG_EVERY` | 12 | Log throttling — only 1 in N consecutive write failures is logged (the first one is always logged). |
 | `MAX_FAIL_STREAK` | 10 | **v1.4.0.** Give up after N consecutive rejected fan writes: exit MCU test mode, hand back to the vendor and write `state/gave_up`. Without this cap a permanently failing tool means the MCU stays stuck in test mode — the vendor's duty frames are rejected too, so *nobody* controls the fan, while the state files still claim the module is in charge. |
+| `TIER_OVERHEAT` | 88 | **v1.6.0.** Duty for the overheat tier. 88% measures 13671–14165 RPM; 100% gives only ~12500 RPM on some units. |
+| `OVERHEAT_HANDBACK` | 0 | **v1.6.0.** `0` = the overheat tier holds `TIER_OVERHEAT`; `1` = restore the old handback to stock. |
+| `CHG0..CHG4` | 60000/65000/70000/75000/79000 | **v1.6.0.** Charger-IC tier thresholds in millidegrees C; must be strictly increasing. |
+| `CHG_HYSTERESIS` | 1500 | **v1.6.0.** Downshift hysteresis for the charger-IC source (1.5°C). |
+| `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0.** Tier ceiling while not `Awake` (`0` quiet, `1` idle … `5` overheat). `-1` disables the clamp. Genuine heat (charger IC ≥ 75°C or skin ≥ 69°C) bypasses it. |
+| `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0.** Refresh `mWakefulness` every N loops (× `LOOP_INTERVAL`). |
 
-To make the overheat tier hold a fixed 90% instead of handing back to the vendor, replace `exit_test_mode` with `set_duty 90` in the `main` loop's overheat branch and drop the `IN_TEST` bookkeeping there — but you then lose the vendor's own high-temperature protection.
+The overheat tier is controlled by `OVERHEAT_HANDBACK`: with the default `0` the module holds `TIER_OVERHEAT=88%` itself; set it to `1` to restore the handback to stock. Stock steady state is only duty 40% / ~7790 RPM, so handback usually means *less* cooling — only enable it if you trust the vendor's protection logic more. To change the ceiling, edit `TIER_OVERHEAT` directly (the module accepts 0–100, but 88% is usually the measured peak).
 
-### Config validation
+### Config validation (v1.5.0+)
 
 `config.cfg` is read through a **whitelist** (v1.5.0): each `KEY=VALUE` line is parsed, only
 the known numeric keys are accepted, and any value containing command substitution (`$( )`,
@@ -184,19 +221,23 @@ effect:
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 ```
 
+v1.6.0 also fixed a **silent failure**: the old parser did not strip trailing comments, so `KEY=25   # note` was rejected as non-numeric and fell back to the default (14 keys were reset in one observed run). Comments are now stripped before validation. `CHG0..CHG4` must be strictly increasing, and `SCREEN_OFF_MAX_RANK` is clamped to `-1..5`.
+
 ### Self-test
 
 ```sh
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-Runs the tier ladder, hysteresis and RPM gate as pure logic against a scratch state directory. It does not touch the fan or the real sensor node, so it is safe to run any time. Use it to see exactly what a given `config.cfg` will do before you rely on it. `action.sh selftest` is a shorthand for the same thing.
+Runs the tier ladder, hysteresis, the two-source merge, the screen-off clamp and the RPM gate as pure logic against a scratch state directory. It does not touch the fan or the real sensor node, so it is safe to run any time. Use it to see exactly what a given `config.cfg` will do before you rely on it. `action.sh selftest` is a shorthand for the same thing.
+
+The self-test must run on the device (or in WSL): Git Bash has no `/data`, so `mkdir /data/local/tmp/...` fails and the script exits silently, looking like it hung.
 
 ### Notes
 
 1. **Root required.** `gd32ipdclient_test` talks to a root-only binder service; a plain shell cannot drive it.
 2. **Unofficial method.** Uses PICO's factory test program; no public interface is exposed. Firmware updates may change the paths or parameters. The scripts degrade gracefully if the tool or the temp node is missing, but they will not force-lock the fan — if they cannot get control, they exit and let the vendor take over.
-3. **Vendor service always runs.** It is never killed. Its high-temp protection logic re-activates at the overheat tier. Under normal temperatures you will just be cooler.
+3. **Vendor service always runs.** It is never killed. Its temperature sampling and state machine keep working; only its duty writes stop reaching the motor. v1.6.0 does **not** hand control back at the overheat tier by default (stock holds only 40% / ~7790 RPM); set `OVERHEAT_HANDBACK=1` to restore the vendor's high-temperature protection.
 4. **Fan speed ceiling:** duty 88% measures 13671 RPM; duty 100% is around 12500 on some units. Noise rises noticeably above duty ~85%.
 5. **Uninstall restores stock.** No manual cleanup needed; `stop.sh` exits test mode **and kills the running `service.sh` loop** (v1.4.0 — killing it matters: a surviving loop notices the missing `in_test` flag and immediately retakes test mode, which is why an uninstalled module could leave the fan stuck at one speed until reboot), then restarts the vendor service.
 6. **Auto-takeover on reboot**, unless you turned it off with `action.sh disable` — that writes `state/disabled` and is honoured across reboots.
@@ -204,6 +245,9 @@ Runs the tier ladder, hysteresis and RPM gate as pure logic against a scratch st
 8. **A silent module is the failure mode to watch for.** The loop logs only on state changes, so a healthy system is quiet. If the log fills with rejection lines, run `action.sh status` and `service.sh --selftest` — they report whether the module actually holds the MCU test-mode lock rather than assuming it does.
 9. **`status` prints "last successful fan write: N seconds ago"** (v1.4.0). This is the single most useful line when something looks wrong: a module that is running but has not written successfully for minutes has no real control, no matter what the other state files say.
 10. **Only one `service.sh` runs at a time** (v1.4.0). It records its pid in `state/service.pid` and refuses to start when that process is still alive — `pgrep`/`pkill` alone are not reliable enough, and two loops fighting over the duty is a real failure mode.
+11. **Screen-off does not mean the fan stops** (v1.6.0). Once the device sleeps, the daemon is frozen and the fan stays at the last duty written. The module clamps the tier to `SCREEN_OFF_MAX_RANK` (default idle 25%) when not `Awake`, except under genuine heat. Pinning a duty with `action.sh set` stops `service.sh`, so the clamp does not apply in that mode.
+12. **The charger IC is a second temperature source** (v1.6.0). `/sys/class/power_supply/battery/charger_temp` is in 0.1°C units; `charger_temp_max=800` means 80°C, above which the driver cuts input to 277mA — the direct cause of "plugged in but losing charge". `pm8150b_tz` reports temperature too, but has no cooling device bound, so the thermal framework cannot act on it; the module reads the NTC itself and adds fan speed / raises the tier.
+13. **`gd32ipdclient_test` exits 0 even on failure.** Judge success only by `success` in the output; the peer can also hang, so wrap manual calls in `timeout`. The module already handles this with background + polling + process-group kill.
 
 ### Files
 
@@ -215,12 +259,14 @@ Runs the tier ladder, hysteresis and RPM gate as pure logic against a scratch st
 | `stop.sh` | Exit test mode and restore stock policy on uninstall |
 | `action.sh` | Manual enable/disable / status / selftest |
 | `config.cfg` | Thresholds and tier duties |
-| `CHANGELOG.md` | Version history and the v1.3.0 bug-fix notes |
-| `.gitattributes` | Forces LF for scripts and config |
+| `META-INF/` | Magisk installer; the release zip is flashable |
+| `CHANGELOG.md` | Version history and per-release fix notes |
+| `notes.md` | Release notes and upgrade hints |
+| `.gitattributes` | Forces LF for scripts, config and installer files |
 
 ### Credit
 
-The core locking mechanism (`setfantestmode`) was discovered via [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). That project does manual speed control only (min 50%, no temperature feedback, does not handle the unlock path). This module adds skin-temperature stepped control, full 0–100% range, overheat handback, and automatic boot takeover via Magisk.
+The core locking mechanism (`setfantestmode`) was discovered via [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). That project does manual speed control only (min 50%, no temperature feedback, does not handle the unlock path). This module adds skin-temperature stepped control, a charger-IC second temperature source, the full 0–100% range, a screen-off clamp, automatic re-arm after lock loss, and automatic boot takeover via Magisk.
 
 ---
 
@@ -493,9 +539,9 @@ Snapdragon 865 ──UART /dev/ttyHS1──> GD32 MCU ──PWM──> мото�
 | Свободный ход | 30–40% | ~7050 | ~52°C |
 | Высокая нагрузка (12 процессов, 5 мин) | 30→35% затем **заблокировано** | ~6200 | 45.7°C → 51.8°C, продолжает расти |
 
-Под нагрузкой вентилятор поднимается до 35% и останавливается. Температура кожи растёт до 51.8°C, а вентилятор не реагирует.
+Под нагрузкой вентилятор поднимается до 35% и останавливается. Температура кожи растёт до 51.8°C, а вентилятор не реагирует. Повторные измерения в v1.6 показали, что заводская политика выходит на duty 40% / ~7790 RPM (в другом прогоне — 35% / 6989 RPM) — **всё ещё слабее любой ступени этого модуля**.
 
-Этот модуль заменяет эту политику ступенчатой кривой, на одну ступень выше заводской.
+Этот модуль заменяет эту политику ступенчатой кривой по **температуре кожи и температуре ИС зарядки** — берётся более высокая из двух.
 
 ### Ключевой механизм: тестовый режим MCU
 
@@ -517,18 +563,40 @@ Duty, записанный через `setfantestspeed`, не затрагива
 
 Выход из тестового режима не разблокирует немедленно — MCU всё ещё ждёт повторного handshake с vendor (`79 00 00 00 28 23 00 00 01 73` принят, `ret=10`), прежде чем снова принимать duty-кадры. Поэтому путь выхода перезапускает `pxrfanservice`, чтобы запустить этот handshake.
 
+С v1.6.0 каждый цикл также сверяет запрошенный duty с `getfaninfo`. Если vendor забрал вентилятор обратно (drift), модуль сразу повторяет запись и заново включает тестовый режим; в тесте с имитацией потери блокировки он восстановился **за 15 секунд** (duty 40→88, RPM ~7791→14035). `state/cur_duty` хранит только последнее намерение модуля — проверять нужно `getfaninfo`.
+
 ### Ступени охлаждения
 
-Источник температуры: `/sys/class/thermal/thermal_zone86/temp` (skin-msm-therm-usr, миллиградусы Цельсия)
+С v1.6.0 используются два источника температуры; активная ступень — более высокая из двух:
+
+| Источник | Узел | Примечание |
+|---|---|---|
+| Кожа | `/sys/class/thermal/thermal_zone86/temp` | skin-msm-therm-usr, миллиградусы Цельсия; это **виртуальная модельная величина**, а не реальная температура кожи |
+| ИС зарядки | `/sys/class/power_supply/battery/charger_temp` | NTC, единицы 0.1°C; выше 80°C драйвер срезает вход до 277mA — прямая причина «заряжается, но теряет заряд» |
+
+Ступени по температуре кожи (перекалибровано для этого устройства в v1.6.0):
 
 | Т-ра кожи | ступень | duty | Измеренные RPM |
 |---|---|---|---|
-| < 41°C | тихий | 0% | 0 |
-| 41–47°C | свободный | 25% | 4346 |
-| 47–50°C | тёплый | 55% | ~9000 |
-| 50–53°C | горячий | 65% | ~10600 |
-| 53–56°C | очень горячий | 78% | 12220 |
-| ≥ 56°C | **возврат заводской политики** | решает vendor | |
+| < 57°C | тихий | 0% | 0 |
+| 57–63°C | свободный | 25% | 4346–5036 |
+| 63–65°C | тёплый | 55% | 7548–9766 |
+| 65–67°C | горячий | 65% | 10600–11072 |
+| 67–69°C | очень горячий | 78% | 12220 |
+| ≥ 69°C | перегрев | 88% | 13671–14165 |
+
+Ступени по ИС зарядки (`CHG0..CHG4`, по умолчанию 60/65/70/75/79°C):
+
+| Т-ра ИС зарядки | Ступень |
+|---|---|
+| < 60°C | тихий |
+| 60–65°C | свободный |
+| 65–70°C | тёплый |
+| 70–75°C | горячий |
+| 75–79°C | очень горячий |
+| ≥ 79°C | перегрев |
+
+Для понижения должны остыть оба источника: кожа ниже `порог − HYSTERESIS` (по умолчанию 0.8°C), ИС зарядки ниже `порог − CHG_HYSTERESIS` (по умолчанию 1.5°C). Если узел ИС зарядки недоступен или возвращает `-22`, этот источник отключается и остаётся только управление по коже.
 
 Измеренная кривая duty → RPM на PICO A8110:
 
@@ -536,19 +604,19 @@ Duty, записанный через `setfantestspeed`, не затрагива
 |---|---|---|---|---|---|---|---|---|---|---|
 | RPM | 0 | 3456 | 3488 | 4346 | 5132 | 5973 | 7548 | ~10600 | 12220 | 13671 |
 
-Примерно 3450 RPM — минимальные обороты, на которых вентилятор вообще вращается, поэтому duty ниже ~15% практически равен выключенному.
+Примерно 3450 RPM — минимальные обороты, на которых вентилятор вообще вращается, поэтому duty ниже ~15% практически равен выключенному. **88% — измеренный максимум оборотов**: duty 100% на некоторых экземплярах даёт лишь ~12500 RPM, а выше ~85% шум заметно растёт.
 
-**Почему T0 = 41°C, а не 38°C.** У PICO 4, лежащего с выключенным экраном, температура кожи составляет 37.5–40°C. Порог 38°C попадает ровно на эту температуру простоя, а первая ступень — 45% (~7500 RPM), что давало мигание 0 ↔ 7500 RPM: вентилятор на неиспользуемом шлеме сам запускался и останавливался каждые несколько минут.
+**Почему пороги 57/63/65/67/69°C.** `zone86` — виртуальная модельная величина: на этом устройстве бодрствующий SoC держится на 63–76°C, а без нагрузки на голове — 57–61°C. Старые пороги 41/47/50/53/56 означали «бодрствование = перегрев», поэтому вентилятор сутками стоял на 88% — это и была прямая причина «после выключения экрана всё ещё шумно». Новые пороги откалиброваны на этом устройстве; безопасность зарядки больше не зависит от них, за неё отвечает источник `charger_temp`.
 
-Тихая ступень соответствует заводскому поведению около 36°C (вентилятор выключается).
+**Ступень перегрева больше не отдаётся vendor по умолчанию (v1.6.0).** Заводской установившийся режим — всего duty 40% / ~7790 RPM, поэтому отдавать управление более слабой политике при нагреве — обратный эффект. При ≥69°C модуль сам держит 88%. Чтобы вернуть старое поведение, установите `OVERHEAT_HANDBACK=1`; управление вернётся только после того, как кожа опустится до `OVERHEAT_RELEASE_RANK` (по умолчанию 3 = горячий).
 
-Последняя ступень намеренно возвращает управление заводской прошивке: когда становится по-настоящему жарко, выход из тестового режима, перезапуск vendor-сервиса и восстановление заводской логики термозащиты безопаснее, чем удержание фиксированного duty этим модулем. Управление возвращается только когда кожа опускается до ступени `HOT` (`OVERHEAT_RELEASE_RANK`, по умолчанию 3) — отдать управление и через пять секунд забрать его обратно лишает смысла всю защиту.
+**Гистерезис**: ступень растёт сразу при переходе порога, а падает только после падения ниже `порог − HYSTERESIS`. (В v1.2.0 это было описано в документации, но в коде, кроме тихой ступени, не реализовано — параметр ни на что не влиял.)
 
-**Гистерезис**: ступень растёт сразу при переходе порога, а падает только после падения ниже `порог − ГИСТЕРЕЗИС` (по умолчанию 800 мС = 0.8°C). (В v1.2.0 это было описано в документации, но в коде, кроме тихой ступени, не реализовано — параметр ни на что не влиял.)
+**Ограничение по RPM, с температурным шлюзом**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000) **и** текущая температурная ступень не ниже `RPM_RELEASE_RANK` (по умолчанию 3 = горячий, т.е. кожа ≥ 65°C или ИС зарядки ≥ 70°C), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%).
 
-**Ограничение по RPM, с температурным шлюзом**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000) **и** текущая температурная ступень не ниже `RPM_RELEASE_RANK` (по умолчанию 3 = горячий, т.е. кожа ≥ 50°C), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%).
+Именно температурный шлюз делает это правило безопасным. Без него правило залипает навсегда, причём так, что при чтении кода это незаметно: rpm ≥ 12000 задаёт duty 88%; при duty 88% вентилятор снова сообщает ≥ 12000 rpm; условие остаётся истинным вечно, а температурная таблица полностью игнорируется. Единственный выход — снизить duty, но для этого rpm уже должен быть ниже порога. Измеренный rpm действительно достигает 13671 при duty 88%, то есть это достижимо в обычной работе, и вентилятор крутился бы почти на максимуме в простое до перезагрузки. Со шлюзом обороты падают, как только температура снижается.
 
-Именно температурный шлюз делает это правило безопасным. Без него правило залипает навсегда, причём так, что при чтении кода это незаметно: rpm ≥ 12000 задаёт duty 88%; при duty 88% вентилятор снова сообщает ≥ 12000 rpm; условие остаётся истинным вечно, а температурная таблица полностью игнорируется. Единственный выход — снизить duty, но для этого rpm уже должен быть ниже порога. Измеренный rpm действительно достигает 13671 при duty 88%, то есть это достижимо в обычной работе, и вентилятор крутился бы почти на максимуме в простое до перезагрузки. Со шлюзом обороты падают, как только кожа возвращается ниже 50°C.
+**Ограничение при выключенном экране/сне (v1.6.0)**: когда устройство засыпает, демон замораживается ядром, и вентилятор остаётся на последнем записанном duty (88% перед сном → 88% всю ночь). Поэтому при `mWakefulness` не `Awake` ступень ограничивается `SCREEN_OFF_MAX_RANK` (по умолчанию 1 = свободный 25%), кроме реального перегрева — ИС зарядки ≥ 75°C или кожа ≥ 69°C. `mWakefulness` обновляется каждые 6 циклов (~30 с). Измерено: 65% под нагрузкой → 25% / ~4980 RPM в течение 45 секунд после выключения экрана.
 
 ### Настройка
 
@@ -561,11 +629,15 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"
 # Или перезапустите модуль / устройство.
 ```
 
-Пример `config.cfg` (установленные по умолчанию значения):
+Пример `config.cfg` (установленные по умолчанию значения, v1.6.0):
 
 ```
 TIER_QUIET=0   TIER_IDLE=25   TIER_WARM=55   TIER_HOT=65   TIER_VERYHOT=78
-T0=41000  T1=47000  T2=50000  T3=53000  T4=56000
+TIER_OVERHEAT=88
+OVERHEAT_HANDBACK=0
+T0=57000  T1=63000  T2=65000  T3=67000  T4=69000
+CHG0=60000  CHG1=65000  CHG2=70000  CHG3=75000  CHG4=79000
+CHG_HYSTERESIS=1500
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -575,9 +647,12 @@ RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
 RETRY_BACKOFF=3
 FAIL_LOG_EVERY=12
+MAX_FAIL_STREAK=10
+SCREEN_OFF_MAX_RANK=1
+WAKE_DUMP_INTERVAL=6
 ```
 
-Файл читается с удалением CR, поэтому сохранять его редактором Windows (Notepad и т.п.), который пишет CRLF, безопасно. Пропущенные ключи берут встроенные значения по умолчанию.
+Файл читается с удалением CR, поэтому сохранять его редактором Windows (Notepad и т.п.), который пишет CRLF, безопасно. С v1.6.0 работают и комментарии в конце строки (`TIER_IDLE=25   # пояснение` отбрасывается перед проверкой). Пропущенные ключи берут встроенные значения по умолчанию.
 
 ### Использование
 
@@ -586,16 +661,16 @@ FAIL_LOG_EVERY=12
 Ручное управление (кнопка «Action» в Magisk Manager или из shell):
 
 ```sh
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # duty/об/мин/т-ра/ступень + таблица
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh status"    # т-ра кожи, duty/rpm, ступень, состояние сна, последняя успешная запись
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh enable"    # service.sh управляет вентилятором по температуре
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh disable"   # вернуть заводскую политику
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh set 70"    # зафиксировать duty=70% до disable или restart
-su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->тихий
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh cycle"     # пройти ступени: тихий->свободный->тёплый->горячий->очень->перегрев->тихий
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh restart"   # перечитать config.cfg (перезапуск service.sh)
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # проверка чистой логики, только чтение
 ```
 
-Состояние переключателя переживает перезагрузку (v1.3.0): `state/enabled` означает «модуль управляет вентилятором», `state/disabled` — «пользователь выключил модуль». После `disable` модуль не перехватит управление снова при загрузке. `disable` также возвращает вентилятор vendor, а работающий цикл управления завершается сам.
+Состояние переключателя сохраняется: `state/enabled` означает «модуль управляет вентилятором», `state/disabled` — «пользователь выключил модуль». После `disable` модуль не перехватит управление снова при загрузке. `disable` также возвращает вентилятор vendor, а работающий цикл управления завершается сам.
 
 Для возврата к заводскому поведению: отключите или удалите модуль. `stop.sh` выйдет из тестового режима, перезапустит vendor-сервис и вернёт вентилятор заводскому управлению.
 
@@ -603,21 +678,44 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/action.sh selftest"  # про�
 
 ```sh
 su -c '/system/bin/gd32ipdclient_test getfaninfo'
-# duty=55 rpm=8530 rpm_target=9000 mode=duty mode
+# duty=88 rpm=14035 mode=duty mode
 ```
 
-### Дополнительные ключи (v1.3.0)
+`getfaninfo` — источник истины, `state/cur_duty` — только намерение модуля. Учтите: `gd32ipdclient_test` **возвращает 0 даже при ошибке** — печатает лишь `setfantestspeed N failed` / `=== operation failed! ===`. Успех определяйте по слову `success` в выводе, а не по `$?`.
 
-Помимо таблицы ступеней, в `config.cfg` есть ключи, которых не было в v1.2.0:
+### Дополнительные ключи (v1.3.0–v1.6.0)
+
+Помимо таблицы ступеней, в `config.cfg` есть следующие ключи:
 
 | Ключ | По умолчанию | Значение |
 |---|---|---|
-| `RPM_RELEASE_RANK` | 3 | Температурная ступень (`0` тихий … `4` очень горячий), начиная с которой правилу RPM разрешено поднимать duty. `3` = только при коже ≥ 50°C. Больше — тише, меньше — больше запаса. |
-| `OVERHEAT_RELEASE_RANK` | 3 | Ступень, до которой должна остыть кожа, прежде чем модуль снова возьмёт управление после возврата vendor при перегреве. |
+| `RPM_RELEASE_RANK` | 3 | Температурная ступень (`0` тихий … `5` перегрев), начиная с которой правилу RPM разрешено поднимать duty. `3` = горячий, т.е. кожа ≥ 65°C или ИС зарядки ≥ 70°C. Больше — тише, меньше — больше запаса. |
+| `OVERHEAT_RELEASE_RANK` | 3 | Используется только при `OVERHEAT_HANDBACK=1`: ступень, до которой должна остыть кожа, прежде чем модуль снова возьмёт управление после возврата vendor при перегреве. |
 | `RETRY_BACKOFF` | 3 | Пауза в секундах после отклонённой записи duty перед следующей попыткой. |
 | `FAIL_LOG_EVERY` | 12 | Ограничение логов: из N подряд неудачных записей логируется только одна (первая — всегда). |
+| `MAX_FAIL_STREAK` | 10 | **v1.4.0.** После N подряд отклонённых записей отказаться от управления: выйти из тестового режима, вернуть vendor и записать `state/gave_up`. Без этого предела постоянно падающий инструмент оставляет MCU в тестовом режиме — duty-кадры vendor тоже отклоняются, вентилятором **никто** не управляет, а state-файлы всё ещё утверждают, что модуль главный. |
+| `TIER_OVERHEAT` | 88 | **v1.6.0.** duty ступени перегрева. 88% даёт 13671–14165 RPM; 100% на некоторых экземплярах — лишь ~12500 RPM. |
+| `OVERHEAT_HANDBACK` | 0 | **v1.6.0.** `0` = ступень перегрева держит `TIER_OVERHEAT`; `1` = вернуть старое поведение с передачей vendor. |
+| `CHG0..CHG4` | 60000/65000/70000/75000/79000 | **v1.6.0.** Пороги второго источника (ИС зарядки) в миллиградусах; должны строго возрастать. |
+| `CHG_HYSTERESIS` | 1500 | **v1.6.0.** Гистерезис понижения для источника ИС зарядки (1.5°C). |
+| `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0.** Потолок ступени, когда устройство не `Awake` (`0` тихий, `1` свободный … `5` перегрев). `-1` отключает ограничение. Реальный перегрев (ИС зарядки ≥ 75°C или кожа ≥ 69°C) его обходит. |
+| `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0.** Обновлять `mWakefulness` каждые N циклов (× `LOOP_INTERVAL`). |
 
-Чтобы последняя ступень держала фиксированные 90% вместо возврата vendor, замените `exit_test_mode` на `set_duty 90` в ветке перегрева главного цикла и уберите там работу с `IN_TEST` — но тогда вы теряете заводскую термозащиту.
+Поведением ступени перегрева управляет `OVERHEAT_HANDBACK`: при значении по умолчанию `0` модуль сам держит `TIER_OVERHEAT=88%`; при `1` возвращается передача заводской политике. Заводской установившийся режим — всего duty 40% / ~7790 RPM, поэтому передача обычно означает *меньше* охлаждения; включайте её, только если больше доверяете заводской термозащите. Чтобы изменить потолок, правьте `TIER_OVERHEAT` напрямую (модуль принимает 0–100, но 88% обычно является измеренным максимумом).
+
+### Проверка конфигурации (v1.5.0+)
+
+`config.cfg` с v1.5.0 читается через **белый список**: каждая строка `KEY=VALUE` разбирается, принимаются только известные числовые ключи, а значения с подстановкой команд (`$( )`, обратные кавычки), `;` или `&` отклоняются. Это закрывает прежнюю дыру `source`, когда небрежная или вредоносная правка могла переопределить внутренние переменные (`TOOL`, `STATE_DIR`, `TEMP_NODE`, …) или выполнить произвольные команды от root. После загрузки значения всё равно проверяются: duty ступеней ограничивается 0–100, `T0..T4` должны строго возрастать, `HYSTERESIS` ограничивается (минимальный соседний интервал − 1), а `LOOP_INTERVAL` / `RETRY_BACKOFF` / `FAIL_LOG_EVERY` имеют нижнюю границу 1.
+
+Нижняя граница важна: `sleep` немедленно возвращается при нечисловом или пустом аргументе, поэтому `LOOP_INTERVAL=abc` превращает цикл в busy-loop без задержки (шторм binder-вызовов и загруженное на 100% ядро). `FAIL_LOG_EVERY=0` — деление на ноль, которое полностью отключает логирование ошибок.
+
+Некорректные значения логируются и заменяются значениями по умолчанию. Посмотреть фактически применённые значения:
+
+```sh
+su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
+```
+
+В v1.6.0 также исправлен **тихий отказ**: старый парсер не отбрасывал комментарий в конце строки, поэтому `KEY=25   # пояснение` считался нечисловым и молча откатывался к значению по умолчанию (в одном прогоне сбросились 14 ключей). Теперь комментарий срезается до проверки. Кроме того, `CHG0..CHG4` должны строго возрастать, а `SCREEN_OFF_MAX_RANK` ограничивается диапазоном `-1..5`.
 
 ### Самотест
 
@@ -625,18 +723,25 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-Прогоняет лестницу ступеней, гистерезис и RPM-шлюз как чистую логику во временном каталоге состояния. Вентилятора и реального узла температуры не касается, поэтому запускать можно в любой момент. Удобно, чтобы заранее увидеть, как поведёт себя конкретный `config.cfg`. `action.sh selftest` — то же самое.
+Прогоняет лестницу ступеней, гистерезис, слияние двух источников, ограничение при выключенном экране и RPM-шлюз как чистую логику во временном каталоге состояния. Вентилятора и реального узла температуры не касается, поэтому запускать можно в любой момент. Удобно, чтобы заранее увидеть, как поведёт себя конкретный `config.cfg`. `action.sh selftest` — то же самое.
+
+Самотест нужно запускать на устройстве (или в WSL): в Git Bash нет `/data`, поэтому `mkdir /data/local/tmp/...` завершается ошибкой, и скрипт молча выходит — выглядит как зависание.
 
 ### Примечания
 
 1. **Требуется root.** `gd32ipdclient_test` общается с root-only binder-сервисом; обычный shell не может его вызвать.
 2. **Неофициальный метод.** Используется заводская тестовая программа `gd32ipdclient_test`; публичного интерфейса нет. Обновления прошивки могут изменить пути или параметры. Скрипты корректно деградируют при отсутствии инструмента или узла температуры, но не принудительно блокируют вентилятор — при невозможности получить управление они выходят и отдают контроль vendor.
-3. **Vendor-сервис всегда работает.** Он никогда не убивается. Его логика защиты от перегрева активируется снова на последней ступени. При обычных температурах вы просто будете холоднее.
+3. **Vendor-сервис всегда работает.** Он никогда не убивается. Его замеры температуры и конечный автомат продолжают работать; до мотора просто не доходят его duty-кадры. По умолчанию v1.6.0 **не** передаёт управление vendor на ступени перегрева (заводской режим — только 40% / ~7790 RPM); при `OVERHEAT_HANDBACK=1` заводская термозащита снова включается.
 4. **Потолок оборотов:** при duty 88% измерено 13671 RPM; duty=100% даёт ~12500 RPM. Шум заметно растёт выше duty ~85%.
 5. **Удаление возвращает заводское.** Ручная очистка не нужна; `stop.sh` выходит из тестового режима и перезапускает vendor-сервис.
 6. **Автоперехват при перезагрузке**, если вы не отключали модуль через `action.sh disable` — эта команда пишет `state/disabled`, и флаг сохраняется между перезагрузками.
 7. **Переводы строк важны.** Android sh не считает CR пробельным символом: `service.sh` с CRLF падает на каждой строке (наблюдалось `service.sh[44]: : inaccessible or not found`, модуль полностью мёртв), а `config.cfg` с CRLF добавляет лишний CR в каждое значение. В репозитории есть `.gitattributes` с принудительным LF, `customize.sh` нормализует при установке, а `config.cfg` читается с удалением CR.
 8. **Главный признак проблемы — молчание модуля.** Цикл пишет в лог только при смене состояния, поэтому здоровая система тихая. Если лог заполняется строками об отказах, выполните `action.sh status` и `service.sh --selftest`: они показывают, действительно ли модуль удерживает тестовый режим MCU, а не предполагают это.
+9. **`status` печатает «последняя успешная запись: N секунд назад».** Самая полезная строка при разборе проблем: модуль работает, но минутами не может записать duty — значит, реального управления нет, как бы хорошо ни выглядели остальные state-файлы.
+10. **Одновременно работает только один `service.sh`.** Он пишет pid в `state/service.pid` и отказывается стартовать, если процесс ещё жив: `pgrep`/`pkill` недостаточно надёжны, а два цикла, спорящих за duty, — реальный режим отказа.
+11. **Выключенный экран не означает остановку вентилятора** (v1.6.0). После засыпания демон замораживается, и вентилятор остаётся на последнем записанном duty. Модуль ограничивает ступень до `SCREEN_OFF_MAX_RANK` (по умолчанию свободный 25%), когда устройство не `Awake`, кроме реального перегрева. При фиксации duty через `action.sh set` служба `service.sh` останавливается, и это ограничение не действует.
+12. **ИС зарядки — второй источник температуры** (v1.6.0). `/sys/class/power_supply/battery/charger_temp` выдаёт единицы 0.1°C; `charger_temp_max=800` означает 80°C, выше которых драйвер срезает вход до 277mA — это прямая причина «заряжается, но теряет заряд». `pm8150b_tz` тоже сообщает температуру, но не привязан ни к одному cooling device, поэтому тепловая подсистема не может на него влиять; модуль сам читает NTC и добавляет обороты / повышает ступень.
+13. **`gd32ipdclient_test` возвращает 0 даже при ошибке.** Успех определяйте только по `success` в выводе; другая сторона может зависнуть, поэтому ручные вызовы оборачивайте в `timeout`. Внутри модуль уже решает это через фон + опрос + убийство группы процессов.
 
 ### Файлы
 
@@ -648,12 +753,14 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 | `stop.sh` | Выход из тестового режима и возврат заводской политики при удалении |
 | `action.sh` | Ручное включение/выключение / статус / самотест |
 | `config.cfg` | Пороги и значения duty по ступеням |
-| `CHANGELOG.md` | История версий и список исправлений v1.3.0 |
-| `.gitattributes` | Принудительный LF для скриптов и конфигурации |
+| `META-INF/` | Установщик Magisk; zip из release можно прошивать напрямую |
+| `CHANGELOG.md` | История версий и исправления по релизам |
+| `notes.md` | Примечания к релизу и подсказки по обновлению |
+| `.gitattributes` | Принудительный LF для скриптов, конфигурации и установщика |
 
 ### Благодарности
 
-Ключевой механизм блокировки (`setfantestmode`) обнаружен через [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). Тот проект выполняет только ручное управление скоростью (минимум 50%, без обратной связи по температуре, без обработки пути разблокировки). Этот модуль добавляет ступенчатое управление по температуре кожи, полный диапазон 0–100%, возврат при перегреве и автоматический перехват при загрузке через Magisk.
+Ключевой механизм блокировки (`setfantestmode`) обнаружен через [Seva167/PicoFanControl](https://github.com/Seva167/PicoFanControl). Тот проект выполняет только ручное управление скоростью (минимум 50%, без обратной связи по температуре, без обработки пути разблокировки). Этот модуль добавляет ступенчатое управление по температуре кожи, второй источник температуры (ИС зарядки), полный диапазон 0–100%, ограничение при выключенном экране, автоматический повторный захват после потери блокировки и автоматический перехват при загрузке через Magisk.
 
 ---
 
