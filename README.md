@@ -192,6 +192,8 @@ The temperature gate is what keeps this safe. Without it the rule latches perman
 
 **Screen-off/sleep clamp (v1.6.0)**: once the device sleeps, the daemon is frozen by the kernel and the fan stays at the last duty written (88% before bed → 88% all night). So when `mWakefulness` is not `Awake`, the tier is clamped to `SCREEN_OFF_MAX_RANK` (default 1 = idle 25%), except when genuinely hot — charger IC ≥ 75°C, skin ≥ 69°C or CPU ≥ 87°C. `mWakefulness` is refreshed every 6 loops (~30 s). Measured: 65% under load → 25% / ~4980 RPM within 45 seconds of screen-off.
 
+Because of that exemption, taking the headset off right after playing does **not** silence the fan immediately: measured with the CPU at 92.3°C and duty 88%, switching the screen off kept it at 88% — correctly, the SoC really was hot. The daemon keeps running while `mWakefulness=Asleep` (the log timestamps above span the sleep), so as the SoC cools it steps down by itself: in that run it went to duty 0 about 22 seconds after the load stopped. It does not drone all night.
+
 ### Tuning
 
 All thresholds and tier duties live in `config.cfg` next to `service.sh`. Edit it, then either:
@@ -553,6 +555,8 @@ PICO A8110 实测 duty → RPM 曲线：
 这道温度闸门是安全的关键。没有它，这条规则会永久自锁，而且是那种"读代码时看不出问题"的锁：rpm ≥ 12000 → duty 设为 88%；而在 88% 下风扇上报的 rpm 又 ≥ 12000 → 条件永远成立，同时温度表被完全旁路。唯一的出路是把 duty 降下来，而这又要求 rpm 已经低于阈值——逻辑死锁。实测 duty 88% 时 rpm 真的会到 13671，所以这在日常使用中就能触发，触发后风扇会一直接近满速转下去直到重启。加了闸门之后，温度一回落转速就降下来。把 `RPM_CAP` 设为 `0` 可以完全关掉这条规则。
 
 **熄屏/睡眠压档（v1.6.0）**：设备睡过去后守护会被内核冻结，风扇停在上次写入的 duty 上（睡前 88% → 整晚 88%）。所以检测到 `mWakefulness` 不是 `Awake` 时，档位压到 `SCREEN_OFF_MAX_RANK`（默认 1 = 空闲 25%）；例外是真烫——充电 IC ≥ 75°C、皮肤 ≥ 69°C 或 CPU ≥ 87°C 时不压。`mWakefulness` 每 6 个循环（约 30 秒）刷新一次。实测负载 65% → 熄屏 45 秒内降到 25% / ~4980 RPM。
+
+因为这个豁免，**刚打完游戏就摘下头显，风扇不会立刻安静**：实测 CPU 92.3°C、duty 88% 时息屏，仍然保持 88% —— 这是对的，机器确实还烫。但守护在 `mWakefulness=Asleep` 期间仍在运行（日志时间戳跨过了整个睡眠段），所以随着 SoC 降温它会自己降档：那次实测里负载停掉约 22 秒后就降到了 duty 0。**不会整晚狂转。**
 
 ### 调整
 
@@ -923,6 +927,8 @@ vendor полностью убирает его путь сброса.
 Именно температурный шлюз делает это правило безопасным. Без него правило залипает навсегда, причём так, что при чтении кода это незаметно: rpm ≥ 12000 задаёт duty 88%; при duty 88% вентилятор снова сообщает ≥ 12000 rpm; условие остаётся истинным вечно, а температурная таблица полностью игнорируется. Единственный выход — снизить duty, но для этого rpm уже должен быть ниже порога. Измеренный rpm действительно достигает 13671 при duty 88%, то есть это достижимо в обычной работе, и вентилятор крутился бы почти на максимуме в простое до перезагрузки. Со шлюзом обороты падают, как только температура снижается. Значение `RPM_CAP=0` полностью отключает это правило.
 
 **Ограничение при выключенном экране/сне (v1.6.0)**: когда устройство засыпает, демон замораживается ядром, и вентилятор остаётся на последнем записанном duty (88% перед сном → 88% всю ночь). Поэтому при `mWakefulness` не `Awake` ступень ограничивается `SCREEN_OFF_MAX_RANK` (по умолчанию 1 = свободный 25%), кроме реального перегрева — ИС зарядки ≥ 75°C, кожа ≥ 69°C или CPU ≥ 87°C. `mWakefulness` обновляется каждые 6 циклов (~30 с). Измерено: 65% под нагрузкой → 25% / ~4980 RPM в течение 45 секунд после выключения экрана.
+
+Из-за этого исключения **снятие шлема сразу после игры не заглушает вентилятор мгновенно**: измерено при CPU 92.3°C и duty 88% — после выключения экрана остались на 88%, и это правильно, SoC действительно горячий. Демон продолжает работать при `mWakefulness=Asleep` (временные метки в логе охватывают весь период сна), поэтому по мере остывания SoC он сам понижает ступень: в том прогоне duty упал до 0 примерно через 22 секунды после снятия нагрузки. Всю ночь на высоких оборотах он не работает.
 
 ### Настройка
 

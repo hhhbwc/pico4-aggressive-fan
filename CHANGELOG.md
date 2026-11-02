@@ -128,6 +128,13 @@ the hottest core goes idle its reading can fall 40+°C within 5 s (measured +42.
 Under a rapidly changing workload the duty therefore tracks a jumping input — the reading is
 bimodal, not the module oscillating. Judge stability from the tier ladder under *steady* load.
 
+**Screen off while hot.** Because the sleep clamp is bypassed when genuinely hot, taking the
+headset off straight after playing does not silence the fan at once. Measured: CPU 92.3°C,
+duty 88%, screen switched off → still 88% three seconds later (correct, the SoC really was hot).
+The daemon keeps running while `mWakefulness=Asleep` — the log timestamps span the whole sleep —
+so it steps down on its own as the SoC cools: 22 seconds after the load stopped it was at duty 0.
+The fan does not run all night at high speed.
+
 ### Added
 
 - New config key `VENDOR_STOP` (0/1, default 1).
