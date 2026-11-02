@@ -1,6 +1,45 @@
-# PICO 4 Fan Auto Temp Control v1.6.0
+# PICO 4 Fan Auto Temp Control v1.7.0
 
-**安装包**：`pico4_fan_tempcontrol-v1.6.0.zip`（Magisk 直接刷入，非仅文档）
+**安装包**：`pico4_fan_tempcontrol-v1.7.0.zip`（Magisk 直接刷入）
+
+## v1.7.0
+
+2026-11-02，收到 v1.6 用户反馈（VirtualDJ）：CPU 90°C 时风扇只有 8500 RPM，升速太慢，
+体感比旧版更差。
+
+### Fixed
+
+**只看皮肤模型，不看 CPU。**
+`zone86` 是虚拟模型量，明显滞后：同一份 dump 里最热 CPU 热区 83.7°C，而它只有 73.8°C。
+用户实测 CPU 90°C 时风扇仅 8500 RPM，正好是皮肤 63–65°C 对应的 WARM 55% 档。而 PICO 的 `ChipsetWarnManager` 在 90°C（`0x15f90`）就告警，
+读的正是 zone 1–4/7–10/11。现在把 CPU 热区取最大值作为第三温度源（默认
+78/81/84/87/90°C → 25/55/65/78/88%），档位 = 皮肤/充电 IC/CPU 三者最高档；CPU 90°C
+时给 88%（约 13600 RPM），78°C 就开始升速。
+
+降档要求三路都凉下来（CPU 回滞 2°C）；熄屏压档的「真烫」豁免也加入 CPU ≥ 87°C。
+坏节点/负值自动跳过。`CPU_ENABLE=0` 可退回 v1.6 的双源行为。
+
+### Added
+
+- 新键 `CPU_ENABLE`、`CPU_ZONES`、`CPU0..CPU4`、`CPU_HYSTERESIS`。
+- `--selftest` 新增 [13]：zone 取最大、坏节点跳过、CPU 触发过热、CPU 回滞、
+  `CPU_ENABLE=0`、熄屏豁免。
+- `action.sh status` 同时显示皮肤/充电 IC/CPU 三路温度。
+- 控制循环日志改为三路温度摘要（`skin 65C chg 45C cpu 88C`）。
+
+### 实测数据（本机，PICO A8110）
+
+| 热区 | 温度 |
+|---|---|
+| cpu-0-0-usr (zone1) | 83.7°C |
+| cpu-1-3-usr | 84.5°C |
+| cpuss-1-usr | 82.9°C |
+| gpuss-max-step (zone25) | 81.8°C |
+| skin-msm-therm-usr (zone86) | 73.8°C |
+
+同一时刻皮肤仍低 10°C 左右，这正是 v1.6 在 CPU 90°C 时只给 55% 的原因。
+
+---
 
 ## v1.6.0
 
@@ -36,6 +75,13 @@ PICO 4 / A8110 上实机排查「插着电却掉电」与「熄屏后风扇仍�
 新增 `SCREEN_OFF_MAX_RANK`：检测到非 `Awake` 就把档位压到 IDLE（25%），真烫
 （充电 IC ≥ CHG3 或皮肤 ≥ T4）则不压。
 
+**6. `--selftest` 的阶梯用例在夹具就绪前读取了设备真实 mWakefulness。**
+设备当时在睡眠态 → 命中新增的熄屏压档 → 中间档位被压成 IDLE
+（`63000 -> IDLE`、`67000 -> IDLE`），只有皮肤 ≥ T4 的用例豁免才对。
+现在自检先把夹具置为 `Awake` 再跑。真机复验：
+`63000->WARM / 65000->HOT / 67000->VERYHOT / 69000->OVERHEAT`，
+回滞 `66199->HOT`、`64199->WARM`。模块运行逻辑不受影响。
+
 ### Added
 
 - `--selftest` 增加 [8] 双温度源合流、[10] 熄屏压档的判定用例。
@@ -55,4 +101,4 @@ PICO 4 / A8110 上实机排查「插着电却掉电」与「熄屏后风扇仍�
 
 ---
 
-> 升级提示：`config.cfg` 的皮肤阈值已重标定为 57/63/65/67/69（旧值 41/47/50/53/56 在本机会让风扇整天满转）。若你改过 `config.cfg`，请对照新默认值合并。
+> 升级提示：皮肤阈值已重标定为 57/63/65/67/69（旧 41/47/50/53/56 在本机会让风扇整天满转）。若你改过 `config.cfg`，请对照新默认值合并。

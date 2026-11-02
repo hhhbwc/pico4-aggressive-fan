@@ -1,5 +1,62 @@
 # Changelog
 
+## v1.7.0
+
+2026-11-02. Player feedback: after upgrading to v1.6 the fan felt *worse* — at CPU 90°C
+it sat at 8500 RPM and took too long to spin up.
+
+### Fixed
+
+**1. The fan only followed the skin model, not the CPU.**
+
+`zone86` (`skin-msm-therm-usr`) is a virtual model value and lags the cores: in one dump the
+hottest CPU zone read 83.7°C while `zone86` read 73.8°C. The reported symptom — 8500 RPM at
+CPU 90°C — matches the WARM 55% band, which the skin table reaches only at 63–65°C, so the
+module was still on the skin curve while the SoC sat at PICO's own warning line.
+
+`ChipsetWarnManager.willWarning()` reads `thermal_zone{1,2,3,4,7,8,9,10,11}` and warns above
+`0x15f90` = 90000 m°C. Those are `cpu-0-0-usr`…`cpu-1-3-usr` plus zone 11. The module now
+reads every zone in `CPU_ZONES` and uses the **maximum**, added as a third source:
+
+| Hottest CPU zone | tier | duty |
+|---|---|---|
+| < 78°C | quiet | 0% |
+| 78–81°C | idle | 25% |
+| 81–84°C | warm | 55% |
+| 84–87°C | hot | 65% |
+| 87–90°C | very hot | 78% |
+| ≥ 90°C | overheat | 88% |
+
+The active tier is now `max(skin, charger IC, CPU)`, so at CPU 90°C the fan goes to 88%
+(~13600 RPM) instead of 55%, and it starts ramping at 78°C — before the vendor warning.
+
+**2. Downshift must satisfy all sources.**
+
+`cool_enough()` requires skin below `threshold − HYSTERESIS` (0.8°C), charger IC below
+`threshold − CHG_HYSTERESIS` (1.5°C) **and** CPU below `threshold − CPU_HYSTERESIS` (2°C).
+A missing/negative zone is skipped, so a dead sensor cannot pin the fan high or low.
+
+**3. Screen-off clamp exemption now covers CPU.**
+
+The clamp is bypassed when genuinely hot: skin ≥ 69°C, charger IC ≥ 75°C **or CPU ≥ 87°C**
+(previous two only).
+
+### Added
+
+- `CPU_ENABLE` (default 1), `CPU_ZONES` (default `1,2,3,4,7,8,9,10,11`), `CPU0..CPU4`
+  (78/81/84/87/90°C), `CPU_HYSTERESIS` (2000 m°C).
+- `CPU_ZONES` is validated: comma-separated integers 0–99, max 24 entries; invalid zones are
+  dropped, an empty result falls back to the default list.
+- `service.sh --selftest` adds section [13]: max-of-zones, dead/invalid zone skipping,
+  CPU-driven overheat, CPU hysteresis, `CPU_ENABLE=0`, and the screen-off exemption.
+- Log lines now print all three sources (`skin 65C chg 45C cpu 88C`) instead of skin only.
+- `action.sh status` prints the three temperatures; the tier table shows the CPU thresholds.
+
+### Compatibility
+
+Set `CPU_ENABLE=0` to restore the v1.6 two-source behaviour. The CPU source is enabled by
+default because v1.6's 8500 RPM at 90°C was the reported defect.
+
 ## v1.6.0
 
 2026-10-31 在一台装了眼追面捕套件（PowerHub PH-022 坞 + SG-PC34M 35W 头）的

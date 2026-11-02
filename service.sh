@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# PICO 4 Fan Auto Temp Control — v1.6.0
+# PICO 4 Fan Auto Temp Control — v1.7.0
 #
 # 本版本修掉一批会让模块静默失灵的缺陷，设计意图（皮肤温度分档 + 绕过原厂锁）
 # 与档位机制保持不变。逐条说明见下面的注释和 CHANGELOG.md。
@@ -70,6 +70,17 @@
 # 另：皮肤阈值按本机重标定 41/47/50/53/56 -> 57/63/65/67/69；修掉 config.cfg
 #     行内注释导致所有带注释的键被判定非法、静默回落默认值的缺陷。
 #
+# v1.7.0 新增（玩家反馈：CPU 90C 时风扇只有 8500RPM、升速太慢）
+# ---------------------------------------------------------------------------
+# [13] 第三温度源 = CPU/SoC 热区。zone86 是虚拟皮肤模型值，明显滞后于核心温度：
+#     实测同一时刻 CPU usr 热区 83.7C 时皮肤只有 73.8C；玩家反馈 CPU 90C 时风扇
+#     仅 8500RPM，正好对应皮肤 63-65C 的 WARM 55% 档。而 PICO 自己的
+#     ChipsetWarnManager 在 90C 就告警
+#     （读 zone 1-4/7-10/11，阈值 0x15f90）。现在按 CPU_ZONES 列表逐区读取并
+#     取最大值，档位 = 皮肤/充电IC/CPU 三者最高档；降档同样要求三路都凉下来。
+#     默认 78/81/84/87/90C，即 84C 给 65%、87C 给 78%、90C 给 88%，赶在厂商
+#     告警线之前把转速拉起来。CPU_ENABLE=0 可退回 v1.6 的两源行为。
+#
 # 其它：state/last_run.log 死变量清掉。
 #
 # 用法补充
@@ -133,6 +144,21 @@ CHG3=75000   # -> very hot
 CHG4=79000   # -> overheat（卡在驱动 80C 降档之前）
 CHG_HYSTERESIS=1500
 
+# 修 [13]：第三个温度源 = CPU/SoC 热区取最大值。
+# 默认就是 PICO ChipsetWarnManager 监控的那批 usr 热区：cpu-0-0..3 (zone 1-4)
+# 与 cpu-1-0..3 (zone 7-10)，再加它同样纳入告警的 zone 11。zone86 是虚拟
+# 皮肤模型，滞后于核心温度，只看它会让风扇在 CPU 已经 90C 时还停在 55%。
+# CPU_ZONES 用逗号分隔的 zone 编号；节点读不到/返回负值时自动跳过该区。
+THERMAL_DIR="${PICO4_THERMAL_DIR:-/sys/class/thermal}"
+CPU_ENABLE=1
+CPU_ZONES="1,2,3,4,7,8,9,10,11"
+CPU0=78000   # -> idle       (78C)
+CPU1=81000   # -> warm       (81C)
+CPU2=84000   # -> hot        (84C)
+CPU3=87000   # -> very hot   (87C)
+CPU4=90000   # -> overheat   (90C，厂商 ChipsetWarnManager 的告警线)
+CPU_HYSTERESIS=2000
+
 # Thresholds, in millidegrees C.
 # v1.6 按本机实测重标定（2026-10-31，PICO A8110 + 眼追面捕套件）：这台机器只要
 # 醒着，SoC 就在 63-76C、虚拟皮肤 zone86 常年 57-61C（8 核满载 66C+）。旧的
@@ -192,7 +218,7 @@ WAKE_CACHE=""
 # (2) 值里的 $(...) 或反引号会在 source 时被执行（root 下即任意代码执行）。
 # 所以这里逐行解析：先去 CR，只接受已知数值键，拒绝一切非白名单键与含命令
 # 替换的值。实测注入 TOOL=/system/bin/false 或 PWNED=$(touch ...) 都被忽略。
-CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL"
+CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS"
 
 if [ -r "$CONFIG_FILE" ]; then
     CFG_NORM="$STATE_DIR/config.norm"
@@ -316,6 +342,43 @@ sanitize_config() {
         log "config: 充电IC阈值非单调 ($CHG0,$CHG1,$CHG2,$CHG3,$CHG4)，回落 60/65/70/75/79 C"
         CHG0=60000; CHG1=65000; CHG2=70000; CHG3=75000; CHG4=79000
     fi
+
+    # v1.7 新增 CPU/SoC 源。zone 列表只保留 0-99 的整数编号，最多 24 个，
+    # 非法项直接丢弃；一个合法项都不剩就回落默认的厂商告警热区。
+    clamp_int CPU_ENABLE "$CPU_ENABLE" 0 1 1
+    _cl=$(printf '%s' "$CPU_ZONES" | tr ',' ' ')
+    _cout=""
+    _cn=0
+    for _cz in $_cl; do
+        [ "$_cn" -ge 24 ] && break
+        case "$_cz" in ''|*[!0-9]*) continue ;; esac
+        [ "$_cz" -le 99 ] 2>/dev/null || continue
+        _cout="${_cout:+$_cout,}$_cz"
+        _cn=$((_cn + 1))
+    done
+    if [ -n "$_cout" ]; then
+        CPU_ZONES="$_cout"
+    else
+        log "config: CPU_ZONES='$CPU_ZONES' 无合法 zone，回落 1,2,3,4,7,8,9,10,11"
+        CPU_ZONES="1,2,3,4,7,8,9,10,11"
+    fi
+    CPU_ZONE_LIST=$(printf '%s' "$CPU_ZONES" | tr ',' ' ')
+
+    clamp_int CPU0 "$CPU0" 0 200000 78000
+    clamp_int CPU1 "$CPU1" 0 200000 81000
+    clamp_int CPU2 "$CPU2" 0 200000 84000
+    clamp_int CPU3 "$CPU3" 0 200000 87000
+    clamp_int CPU4 "$CPU4" 0 200000 90000
+    if [ "$CPU0" -ge "$CPU1" ] || [ "$CPU1" -ge "$CPU2" ] \
+       || [ "$CPU2" -ge "$CPU3" ] || [ "$CPU3" -ge "$CPU4" ]; then
+        log "config: CPU阈值非单调 ($CPU0,$CPU1,$CPU2,$CPU3,$CPU4)，回落 78/81/84/87/90 C"
+        CPU0=78000; CPU1=81000; CPU2=84000; CPU3=87000; CPU4=90000
+    fi
+    _gap=$((CPU1 - CPU0)); _g=$((CPU2 - CPU1)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _g=$((CPU3 - CPU2)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _g=$((CPU4 - CPU3)); [ "$_g" -lt "$_gap" ] && _gap=$_g
+    _gap=$((_gap - 1)); [ "$_gap" -ge 0 ] || _gap=0
+    clamp_int CPU_HYSTERESIS "$CPU_HYSTERESIS" 0 "$_gap" 2000
 }
 
 log() {
@@ -474,6 +537,32 @@ read_chg_temp() {
     echo "$((_v * 100))"
 }
 
+# 修 [13]：CPU/SoC 源 = CPU_ZONES 列表里所有可读 zone 的最大值。
+# 单个 zone 读不到、为空、返回负值（-22 之类）都只跳过该区，不影响其它区。
+read_cpu_temp() {
+    [ "$CPU_ENABLE" = "1" ] || { echo ""; return 1; }
+    _max=""
+    for _z in $CPU_ZONE_LIST; do
+        _v=$(cat "$THERMAL_DIR/thermal_zone$_z/temp" 2>/dev/null | tr -d '\r\n ')
+        case "$_v" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ -z "$_max" ] || [ "$_v" -gt "$_max" ]; then
+            _max="$_v"
+        fi
+    done
+    [ -n "$_max" ] || return 1
+    echo "$_max"
+}
+
+# 日志里的人类可读温度源摘要（只在 main 里用，避免每行日志重复拼字符串）。
+temp_summary() {
+    _s="skin $((TS / 1000))C"
+    [ -n "$TC" ] && _s="$_s chg $((TC / 1000))C"
+    [ -n "$TP" ] && _s="$_s cpu $((TP / 1000))C"
+    echo "$_s"
+}
+
 skin_rank() {
     _r=0
     [ "$1" -ge "$T0" ] && _r=1
@@ -495,19 +584,33 @@ chg_rank() {
     echo "$_r"
 }
 
-# 想从 new_rank 这一档降下去，两个源都必须凉到「该档阈值 - 各自回滞」以下。
+cpu_rank() {
+    [ -n "$1" ] || { echo 0; return; }
+    _r=0
+    [ "$1" -ge "$CPU0" ] && _r=1
+    [ "$1" -ge "$CPU1" ] && _r=2
+    [ "$1" -ge "$CPU2" ] && _r=3
+    [ "$1" -ge "$CPU3" ] && _r=4
+    [ "$1" -ge "$CPU4" ] && _r=5
+    echo "$_r"
+}
+
+# 想从 new_rank 这一档降下去，所有可用的源都必须凉到「该档阈值 - 各自回滞」以下。
 cool_enough() {
     case "$1" in
-        5) _ts=$T4;  _tc=$CHG4 ;;
-        4) _ts=$T3;  _tc=$CHG3 ;;
-        3) _ts=$T2;  _tc=$CHG2 ;;
-        2) _ts=$T1;  _tc=$CHG1 ;;
-        1) _ts=$T0;  _tc=$CHG0 ;;
+        5) _ts=$T4;  _tc=$CHG4; _tp=$CPU4 ;;
+        4) _ts=$T3;  _tc=$CHG3; _tp=$CPU3 ;;
+        3) _ts=$T2;  _tc=$CHG2; _tp=$CPU2 ;;
+        2) _ts=$T1;  _tc=$CHG1; _tp=$CPU1 ;;
+        1) _ts=$T0;  _tc=$CHG0; _tp=$CPU0 ;;
         *) return 0 ;;
     esac
     [ "$TS" -lt "$((_ts - HYSTERESIS))" ] || return 1
     if [ -n "$TC" ]; then
         [ "$TC" -lt "$((_tc - CHG_HYSTERESIS))" ] || return 1
+    fi
+    if [ -n "$TP" ]; then
+        [ "$TP" -lt "$((_tp - CPU_HYSTERESIS))" ] || return 1
     fi
     return 0
 }
@@ -526,18 +629,21 @@ wake_state() {
 }
 
 pick_tier() {
-    # 修 [10]：档位取「皮肤」与「充电 IC」两路里较高的那个；修 [3]/[8]：降档时
-    # 两个源都要凉下来才算（各用各自的回滞）。
+    # 修 [10]/[13]：档位取「皮肤」「充电 IC」「CPU/SoC」三路里较高的那个；
+    # 修 [3]/[8]：降档时所有可用的源都要凉下来才算（各用各自的回滞）。
     TS=$(cat "$TEMP_NODE" 2>/dev/null)
     case "$TS" in
         ''|*[!0-9]*) return 1 ;;
     esac
     TC=$(read_chg_temp)
+    TP=$(read_cpu_temp)
 
     rank_s=$(skin_rank "$TS")
     rank_c=$(chg_rank "$TC")
+    rank_p=$(cpu_rank "$TP")
     rank=$rank_s
     [ "$rank_c" -gt "$rank" ] && rank=$rank_c
+    [ "$rank_p" -gt "$rank" ] && rank=$rank_p
 
     prev=$(cat "$CUR_TIER" 2>/dev/null)
     case "$prev" in
@@ -561,12 +667,13 @@ pick_tier() {
     fi
 
     # 修 [12]：熄屏/睡眠压档。守护被冻结后风扇会停在上次写入的 duty 上，
-    # 所以必须在睡前压下来。真烫（充电 IC >= CHG3 或皮肤 >= T4）则不压。
+    # 所以必须在睡前压下来。真烫（充电 IC >= CHG3、皮肤 >= T4 或 CPU >= CPU3）则不压。
     if [ "$SCREEN_OFF_MAX_RANK" -ge 0 ] 2>/dev/null && [ "$new_rank" -gt "$SCREEN_OFF_MAX_RANK" ]; then
         _w=$(wake_state)
         if [ -n "$_w" ] && [ "$_w" != "Awake" ]; then
             _hot=0
             if [ -n "$TC" ] && [ "$TC" -ge "$CHG3" ] 2>/dev/null; then _hot=1; fi
+            if [ -n "$TP" ] && [ "$TP" -ge "$CPU3" ] 2>/dev/null; then _hot=1; fi
             if [ "$TS" -ge "$T4" ] 2>/dev/null; then _hot=1; fi
             if [ "$_hot" = "0" ]; then
                 new_rank=$SCREEN_OFF_MAX_RANK
@@ -760,7 +867,11 @@ main() {
             sleep "$LOOP_INTERVAL"
             continue
         fi
-        t=$(cat "$TEMP_NODE" 2>/dev/null)
+        # pick_tier 在子 shell 里跑，这里重新取一次三路温度，用于日志。
+        TS=$(cat "$TEMP_NODE" 2>/dev/null)
+        TC=$(read_chg_temp)
+        TP=$(read_cpu_temp)
+        _src=$(temp_summary)
 
         # Overheat: hand the fan back to the vendor so its high-temp protection
         # runs. 修 [4]：这次要真的交回一段时间，见下面重新接管的闸门。
@@ -768,7 +879,7 @@ main() {
             if [ -f "$IN_TEST" ]; then
                 exit_test_mode
                 cur_duty_written=""
-                log "skin $((t / 1000))C over heat, MCU test mode exited, vendor policy restored"
+                log "$_src over heat, MCU test mode exited, vendor policy restored"
             fi
             sleep "$LOOP_INTERVAL"
             continue
@@ -779,7 +890,7 @@ main() {
         if [ ! -f "$IN_TEST" ]; then
             if should_reengage "$tier"; then
                 if enter_test_mode; then
-                    log "re-engaged MCU test mode at skin $((t / 1000))C"
+                    log "re-engaged MCU test mode at $_src"
                     cur_duty_written=""
                 fi
             else
@@ -811,7 +922,7 @@ main() {
                 echo "$desired" > "$CUR_DUTY"
                 echo "$cur_tier_name" > "$CUR_TIER"
                 date +%s > "$LAST_OK" 2>/dev/null
-                log "skin $((t / 1000))C rpm ${rpm_now:-?} -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
+                log "$_src rpm ${rpm_now:-?} -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
             else
                 # 修 [1] 的核心：写入被拒 == MCU 那边锁已经没了，标记文件不可信。
                 fail_streak=$((fail_streak + 1))
@@ -827,7 +938,7 @@ main() {
                         echo "$desired" > "$CUR_DUTY"
                         echo "$cur_tier_name" > "$CUR_TIER"
                         date +%s > "$LAST_OK" 2>/dev/null
-                        log "re-armed ok: skin $((t / 1000))C -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
+                        log "re-armed ok: $_src -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
                     fi
                 fi
 
@@ -890,6 +1001,12 @@ selftest() {
     CHG_TEMP_NODE="$CG"
     WF="$TMP/wake"
     WAKE_SRC="$WF"
+    # 默认让所有假 CPU 热区都是 70C（低于 CPU0），不影响上面的皮肤/充电测试。
+    THERMAL_DIR="$TMP/thermal"
+    for _z in $CPU_ZONE_LIST; do
+        mkdir -p "$THERMAL_DIR/thermal_zone$_z"
+        printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"
+    done
     # 自检必须在"醒着"的假设下跑阶梯，否则 [12] 的熄屏压档会把中间档全压成
     # IDLE（实测踩到：WAKE_SRC 指向的文件尚未创建时 wake_state 回落到真实设备
     # 状态，当时设备在睡 -> 除皮肤达到 T4 外全部被压）。
@@ -931,6 +1048,7 @@ selftest() {
     echo "  阈值单调: T0=$T0 < T1=$T1 < T2=$T2 < T3=$T3 < T4=$T4"
     echo "  档位 duty: QUIET=$TIER_QUIET IDLE=$TIER_IDLE WARM=$TIER_WARM HOT=$TIER_HOT VERYHOT=$TIER_VERYHOT OVERHEAT=$TIER_OVERHEAT (HANDBACK=$OVERHEAT_HANDBACK)"
     echo "  充电IC阈值: $CHG0/$CHG1/$CHG2/$CHG3/$CHG4 回滞=$CHG_HYSTERESIS"
+    echo "  CPU阈值: $CPU0/$CPU1/$CPU2/$CPU3/$CPU4 回滞=$CPU_HYSTERESIS 启用=$CPU_ENABLE zones=$CPU_ZONES"
     echo "  熄屏压档: SCREEN_OFF_MAX_RANK=$SCREEN_OFF_MAX_RANK 刷新间隔=$WAKE_DUMP_INTERVAL 圈"
     echo "  非法值会被夹紧/回落并记日志，用 --dumpcfg 看最终生效值。"
 
@@ -965,7 +1083,7 @@ selftest() {
     echo ""
     echo "== [9] 过热档处置（OVERHEAT_HANDBACK=$OVERHEAT_HANDBACK TIER_OVERHEAT=$TIER_OVERHEAT）=="
     echo "VERYHOT" > "$CT"
-    printf '70000' > "$ST"; printf '4500' > "$CG"
+    printf '70000' > "$ST"; printf '450' > "$CG"
     echo "  皮肤 70C（充电IC 45.0C，皮肤单独说了算）-> tier=$(pick_tier) duty=$(tier_duty OVERHEAT)"
     echo "  对比：原厂策略实测 duty 40% / 7790RPM，本模块 88% / 14165RPM"
     echo ""
@@ -983,6 +1101,52 @@ selftest() {
     echo "  期望：IDLE / IDLE(被压) / IDLE(被压) / VERYHOT(充电IC 76C 不压) / OVERHEAT(皮肤 69.9C 不压)"
     printf '%s' "Awake" > "$WF"
     WAKE_CACHE=""
+    echo ""
+    echo "== [13] CPU/SoC 第三温度源（zone 取最大，档位三源取最高）=="
+    echo "  阈值 CPU0..4=$CPU0/$CPU1/$CPU2/$CPU3/$CPU4 回滞=$CPU_HYSTERESIS zones=$CPU_ZONES"
+    for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
+    printf '79000' > "$THERMAL_DIR/thermal_zone1/temp"
+    printf '89000' > "$THERMAL_DIR/thermal_zone7/temp"
+    echo "IDLE" > "$CT"; printf '58000' > "$ST"; printf '450' > "$CG"
+    echo "  皮肤58C zone1=79C zone7=89C -> $(pick_tier)（取最大 89C，应 VERYHOT）"
+    rm -f "$THERMAL_DIR/thermal_zone7/temp"
+    printf '83000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "IDLE" > "$CT"; printf '58000' > "$ST"
+    echo "  zone7 节点消失、zone1=83C -> $(pick_tier)（跳过坏节点，应 WARM）"
+    printf '%s' "-22" > "$THERMAL_DIR/thermal_zone1/temp"
+    printf '%s' "abc" > "$THERMAL_DIR/thermal_zone2/temp"
+    printf '86000' > "$THERMAL_DIR/thermal_zone3/temp"
+    echo "IDLE" > "$CT"
+    echo "  zone1=-22 zone2=abc zone3=86C -> $(pick_tier)（应 HOT）"
+    printf '91000' > "$THERMAL_DIR/thermal_zone4/temp"
+    echo "IDLE" > "$CT"
+    echo "  zone4=91C 皮肤58C -> $(pick_tier)（应 OVERHEAT，duty=$(tier_duty OVERHEAT)）"
+    CPU_ENABLE=0
+    echo "  CPU_ENABLE=0 同一组温度 -> $(pick_tier)（应退回两源：IDLE）"
+    CPU_ENABLE=1
+    echo ""
+    echo "  降档回滞（皮肤58C 充电IC45C，CPU 单独决定）："
+    for x in 86500 84500 81500; do
+        echo "VERYHOT" > "$CT"
+        for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
+        printf '%s' "$x" > "$THERMAL_DIR/thermal_zone1/temp"
+        printf "    CPU=%s.%sC -> %s\n" "$((x / 1000))" "$(((x % 1000) / 100))" "$(pick_tier)"
+    done
+    echo "  期望：86500 卡在 VERYHOT（未低于 87C-2C），84500 退到 HOT，81500 退到 WARM"
+    echo ""
+    echo "  CPU 热也穿透熄屏压档："
+    printf '%s' "Asleep" > "$WF"; WAKE_CACHE=""
+    for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
+    printf '89000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "IDLE" > "$CT"; printf '58000' > "$ST"; printf '450' > "$CG"
+    echo "    Asleep 皮肤58C CPU89C -> $(pick_tier)（应 VERYHOT，不压）"
+    printf '82000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "IDLE" > "$CT"
+    echo "    Asleep 皮肤58C CPU82C -> $(pick_tier)（应 IDLE，被压）"
+    printf '%s' "Awake" > "$WF"
+    WAKE_CACHE=""
+    CPU_ENABLE=1
+    for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
     echo ""
     echo "== [11] 漂移校验：写入被拒即判定丢锁并重接管（只读，不在此处触发）=="
     echo "  实测：注入丢锁后 1 秒内 drift -> re-arm -> duty 恢复，见 logcat -s PicoFanTC"
@@ -1002,6 +1166,7 @@ dumpcfg() {
               OVERHEAT_HANDBACK \
               T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE \
               CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS \
+              CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS \
               SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL \
               RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK \
               RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK; do

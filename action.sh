@@ -44,8 +44,13 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 # Load the same config the service uses, so status shows real thresholds.
 TIER_QUIET=0; TIER_IDLE=25; TIER_WARM=55; TIER_HOT=65; TIER_VERYHOT=78
-T0=41000; T1=47000; T2=50000; T3=53000; T4=56000
+TIER_OVERHEAT=88; OVERHEAT_HANDBACK=0
+T0=57000; T1=63000; T2=65000; T3=67000; T4=69000
 HYSTERESIS=800
+CHG0=60000; CHG1=65000; CHG2=70000; CHG3=75000; CHG4=79000; CHG_HYSTERESIS=1500
+CPU_ENABLE=1; CPU_ZONES="1,2,3,4,7,8,9,10,11"
+CPU0=78000; CPU1=81000; CPU2=84000; CPU3=87000; CPU4=90000; CPU_HYSTERESIS=2000
+SCREEN_OFF_MAX_RANK=1; WAKE_DUMP_INTERVAL=6
 RPM_CAP=12000; RPM_DUTY=88; RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
 MAX_FAIL_STREAK=10
@@ -242,9 +247,26 @@ tier_table() {
         "$RPM_CAP" "$RPM_DUTY" "$MAX_FAIL_STREAK"
     printf "  第二温度源=充电IC NTC，档位 %s/%s/%s/%s/%s mC 回滞 %s\n" \
         "${CHG0:-60000}" "${CHG1:-65000}" "${CHG2:-70000}" "${CHG3:-75000}" "${CHG4:-79000}" "${CHG_HYSTERESIS:-1500}"
+    printf "  第三温度源=CPU/SoC 热区 %s 取最大，档位 %s/%s/%s/%s/%s mC 回滞 %s (启用=%s)\n" \
+        "${CPU_ZONES:-1,2,3,4,7,8,9,10,11}" \
+        "${CPU0:-78000}" "${CPU1:-81000}" "${CPU2:-84000}" "${CPU3:-87000}" "${CPU4:-90000}" \
+        "${CPU_HYSTERESIS:-2000}" "${CPU_ENABLE:-1}"
     _wk=$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
     printf "  熄屏压档: 上限档=%s (0=QUIET 1=IDLE 2=WARM … -1=关闭) | 当前 mWakefulness=%s\n" \
         "${SCREEN_OFF_MAX_RANK:--1}" "${_wk:-?}"
+}
+
+# 与 service.sh 同口径：CPU_ZONES 里所有可读热区的最大值，读不到返回空。
+read_cpu_max() {
+    [ "${CPU_ENABLE:-1}" = "1" ] || { echo ""; return 1; }
+    _max=""
+    for _z in $(printf '%s' "${CPU_ZONES:-}" | tr ',' ' '); do
+        _v=$(cat "/sys/class/thermal/thermal_zone$_z/temp" 2>/dev/null | tr -d '\r\n ')
+        case "$_v" in ''|*[!0-9]*) continue ;; esac
+        if [ -z "$_max" ] || [ "$_v" -gt "$_max" ]; then _max="$_v"; fi
+    done
+    [ -n "$_max" ] || return 1
+    echo "$_max"
 }
 
 status() {
@@ -261,7 +283,7 @@ status() {
         fi
     elif in_test_mode; then
         if [ -f "$ENABLED" ]; then
-            echo "模式: 本模块温控 (duty 由「皮肤温度」与「充电 IC NTC」两者较高档决定)"
+            echo "模式: 本模块温控 (duty 由「皮肤温度」「充电 IC NTC」「CPU/SoC 热区」三者较高档决定)"
         else
             echo "模式: MCU test mode 已开，但 service.sh 未运行"
         fi
@@ -281,7 +303,12 @@ status() {
     cur_duty=$(cat "$CUR_DUTY" 2>/dev/null || echo "(none)")
 
     if [ -n "$t" ]; then t_c="$((t / 1000))"; else t_c="?"; fi
-    printf "皮肤温度 %s°C | 风扇 duty=%s%% rpm=%s\n" "$t_c" "${d:-?}" "${r:-?}"
+    tc=$(cat /sys/class/power_supply/battery/charger_temp 2>/dev/null | tr -d '\r\n ')
+    case "$tc" in ''|*[!0-9]*) tc="?" ;; *) tc="$((tc / 10)).$((tc % 10))" ;; esac
+    tp=$(read_cpu_max)
+    if [ -n "$tp" ]; then tp_c="$((tp / 1000))"; else tp_c="?"; fi
+    printf "温度源: 皮肤 %s°C | 充电IC %s°C | CPU %s°C\n" "$t_c" "$tc" "$tp_c"
+    printf "风扇: duty=%s%% rpm=%s\n" "${d:-?}" "${r:-?}"
     printf "vendor=%s | 当前档=%s (上次写入 duty=%s)\n" "${v:-?}" "$cur_tier" "$cur_duty"
     [ -n "$svc" ] && printf "service.sh PID=%s\n" "$svc"
     # 最后一次成功写入风扇的时间。模块"看起来在跑"但这个值一直不更新，
