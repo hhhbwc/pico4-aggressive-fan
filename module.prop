@@ -1,7 +1,7 @@
 id=pico4_fan_tempcontrol
 name=PICO 4 Fan Auto Temp Control (风扇自动温控)
-version=v1.7.0
-versionCode=8
+version=v2.0.0
+versionCode=9
 author=Zubastik
-description=停掉 PICO 原厂风扇策略（负载下锁在 35–40%），改为按三路温度取最高档调速：皮肤 thermal_zone86、充电 IC battery/charger_temp、CPU 热区 1-4/7-10/11 取最大值。档位 0/25/55/65/78/88%。v1.7.0 新增 CPU/SoC 温度源（78/81/84/87/90°C），修掉 CPU 90°C 时风扇仍只有 8500 RPM、升速滞后的问题；升档需连续 2 个循环确认，避免单核尖峰误升档。v1.6.0 已含充电 IC 源、过热档不再交回原厂、熄屏压档、漂移丢锁重接管。详见 CHANGELOG.md。卸载即恢复原厂。
+description=停掉 PICO 原厂风扇策略，按三路温度（皮肤 / 充电 IC / CPU 热区取最大值）分档调速，档位 0/25/55/65/78/88%。v2.0.0 重写控制方式：停掉 pxrfanservice，改用厂商正常接口 setfanspeed 调速 —— 不再和原厂抢 MCU test mode，也就没有锁被重置、反复 re-arm 的问题；实测 80% 稳定保持、响应立即、屏幕开关不会把原厂拉回来。停厂商失败或接口被拒时自动回退 test mode；交还/禁用/卸载/守护退出都会恢复厂商服务，watchdog 在守护被 kill -9 时兜底。v1.7.0 加入 CPU/SoC 第三温度源与升档平滑；v1.6.0 加入充电 IC 源、熄屏压档、漂移重接管。详见 CHANGELOG.md。卸载即恢复原厂。
 minMagisk=24000

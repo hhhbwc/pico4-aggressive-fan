@@ -1,6 +1,84 @@
-# PICO 4 Fan Auto Temp Control v1.7.0
+# PICO 4 Fan Auto Temp Control v2.0.0
 
-**安装包**：`pico4_fan_tempcontrol-v1.7.0.zip`（Magisk 直接刷入）
+**安装包**：`pico4_fan_tempcontrol-v2.0.0.zip`（Magisk 直接刷入）
+
+## v2.0.0
+
+2026-11-02，重写控制方式。本版解决的是「控制权老是被原厂抢走」这个老问题。
+
+### Changed
+
+**停掉原厂服务，改用它自己的正常接口调速。**
+
+原厂的风扇策略只在一个 init 服务 `pxrfanservice` 里。v1.x 用的是 PICO 出厂测试程序那套命令，
+靠 MCU 锁把原厂的 duty 帧拒掉：
+
+```sh
+gd32ipdclient_test setfantestmode 1      # v1.x：把 MCU 锁住
+gd32ipdclient_test setfantestspeed 55
+```
+
+这把锁很脆。原厂 `PxrFanService` 的日志显示它在 `system_screen_on/off`、
+`system_vrmode_start/stop` 时会做 reset，并且每 10 秒左右就重写一次自己的 duty（`fanState=35`）。
+MCU 的锁一掉，原厂的下一帧就赢，模块再花一个漂移周期重建 test mode——这就是「老被抢」。
+
+而原厂本来就有**正常通路**：`gd32ipdclient_test setfanspeed N` 走的是
+`gd32ipdservice.SetFanSpeed`，和 `pxrfanservice` 自己用的是同一个接口。作者实测对比：
+
+| | v1.x test mode | v2.0.0 停原厂 + `setfanspeed` |
+|---|---|---|
+| 原厂服务 | 一直跑，每 ~10 秒写一次 | 接管时停一次 |
+| duty 保持 | MCU 锁一掉就被拒 | 稳定 |
+| 原厂重启（开关屏） | 会重写自己的 duty | watchdog 再次停掉它 |
+| 被抢后要做什么 | ~15 秒重建 test mode | 不用——没有竞争者 |
+
+现在模块在接管时停掉 `pxrfanservice`（`setprop ctl.stop pxrfanservice`；模块进程在
+`u:r:magisk:s0`，本机 SELinux 是 Permissive，实测可用），再用 `setfanspeed` 写 duty。
+**没有 MCU 锁，就没有可丢的东西，也没有要重建的东西。**
+
+实机验证：停掉原厂后 duty 80% 稳定保持 90 秒（12600–12900 RPM）；30%、0% 立即响应；
+开关屏不会把原厂拉回来；满载时模块在原厂全程停着的情况下走完 0% → 25% → 88%，
+并稳定在 88% / ~13400 RPM。
+
+**停不掉或接口被拒时自动回退。**
+如果 `pxrfanservice` 停不掉、或者 `setfanspeed` 被拒，模块自动退回 v1.x 的 test mode 通路，
+保证任何时候都有东西在管风扇。当前用的通路记在 `state/ctrl_mode`（`vendor` / `test`），
+`action.sh status` 会显示。新增配置键 `VENDOR_STOP`（默认 `1`），设成 `0` 可强制回到旧行为。
+
+**新增 `watchdog.sh`：风扇绝不会被丢下不管。**
+停了原厂就意味着守护一旦崩掉，风扇会停在最后的 duty 上而没人管。`watchdog.sh` 每 5 秒检查一次，
+专门补上守护自身 `EXIT` trap 管不到的情况——`service.sh` 被 `kill -9` 打死。它会重启
+`pxrfanservice`、清掉接管标记，然后退出。
+
+实机验证：`kill -9` 打死守护后，watchdog 在约 5 秒内把原厂拉了回来
+（`watchdog: service.sh is gone but fan is still owned, restoring vendor`），风扇回到原厂自己的
+duty（50% / ~8550 RPM），接管标记被清掉。系统在模块接管期间把原厂拉起来时，watchdog 也会
+再停一次。
+
+其余退出路径本来就会恢复原厂：`action.sh disable`、卸载（`stop.sh`）、连续
+`MAX_FAIL_STREAK` 次写失败后放弃、守护的 `EXIT` trap。
+
+**`stop.sh` 现在也会杀 watchdog。**
+以前卸载只杀守护，watchdog 会残留；它看到接管标记没了最多 5 秒后自己退出，现在改成显式杀掉。
+
+### Added
+
+- 新配置键 `VENDOR_STOP`（0/1，默认 1）。
+- 新文件 `watchdog.sh`，`customize.sh` 会一并安装并加执行权限。
+- `action.sh status` 现在会显示当前控制方式（`厂商服务已停 + setfanspeed` 或
+  `MCU test mode (回退)`），以及实时的 `vendor=running|stopped`。
+- `--selftest` 新增 [15]：控制方式 → duty 命令的映射（`vendor` → `setfanspeed`，
+  `test` → `setfantestspeed`）。
+
+### 未改动
+
+温度侧一切照旧：三路温度源（皮肤 / 充电 IC / CPU-SoC）、档位阶梯与各档 duty、回滞、
+熄屏压档、RPM 闸门、升档平滑、配置校验。README 里的档位、阈值和实测 RPM 数据没有变化。
+
+### 升级提示
+
+- 刷 release zip 会整个替换模块目录，包括 `config.cfg`。自定义过的先备份。
+- 升级后模块会先退出 v1.x 可能残留的 MCU test mode 再接管，否则 `setfanspeed` 会被拒。
 
 ## v1.7.0
 
@@ -41,7 +119,8 @@
 `CPU_ZONES` 只允许数字和逗号，其它整行丢弃。
 
 **`config.cfg` 不是普通文件时守护会挂死。**
-`[ -r ]` 对目录也为真，而 `tr -d '' < 目录` 会一直循环（EISDIR）。实测设备上留下
+`[ -r ]` 对目录也为真，而 `tr -d '
+' < 目录` 会一直循环（EISDIR）。实测设备上留下
 两个 100% CPU 的 `tr`，`--dumpcfg` 永不返回。现在两个脚本都先用 `[ -f ]` 判断。
 
 ### Added

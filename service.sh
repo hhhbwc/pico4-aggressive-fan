@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# PICO 4 Fan Auto Temp Control — v1.7.0
+# PICO 4 Fan Auto Temp Control — v2.0.0
 #
 # 本版本修掉一批会让模块静默失灵的缺陷，设计意图（皮肤温度分档 + 绕过原厂锁）
 # 与档位机制保持不变。逐条说明见下面的注释和 CHANGELOG.md。
@@ -85,6 +85,16 @@
 #     cpu-1-3-usr 在 70-82C 间跳）。要求连续 UPSHIFT_CONFIRM 个循环（默认 2，
 #     约 5 秒）都高于当前档位才升档，降档与回滞不变。UPSHIFT_CONFIRM=1 关闭。
 #
+# v2.0.0 重写（[15]）
+# ---------------------------------------------------------------------------
+# 不再和 pxrfanservice 抢 MCU test mode。stop pxrfanservice 之后，用厂商自己的
+# 正常接口 gd32ipdclient_test setfanspeed 调速：没有 MCU 锁，就没有"锁被原厂
+# 重置掉"这回事，drift/re-arm 降为兜底。实测 80% 稳定保持 90 秒、80->30->0
+# 立即响应、停掉厂商后 3 分钟不自启，屏幕开关也拉不起来。
+# 停厂商失败或 setfanspeed 被拒时自动回退 test mode；交还/禁用/卸载/守护退出
+# 都会 start pxrfanservice。watchdog.sh 在守护被 kill -9 时兜底恢复厂商。
+# VENDOR_STOP=0 可强制回到 v1.x 的 test mode 行为。
+#
 # 其它：state/last_run.log 死变量清掉。
 #
 # 用法补充
@@ -110,12 +120,17 @@ DISABLED="$STATE_DIR/disabled"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
 IN_TEST="$STATE_DIR/in_test"
+OWNED="$STATE_DIR/owned"
+CTRL_MODE="$STATE_DIR/ctrl_mode"
+WATCHDOG_PID="$STATE_DIR/watchdog.pid"
 LAST_OK="$STATE_DIR/last_ok"
 GAVE_UP="$STATE_DIR/gave_up"
 PID_FILE="$STATE_DIR/service.pid"
 UPSHIFT_PENDING="$STATE_DIR/upshift_pending"
 
 TOOL="/system/bin/gd32ipdclient_test"
+VENDOR_PROP_STATE="sys.pxrfanservice.state"
+WATCHDOG="$MODDIR/watchdog.sh"
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 
@@ -169,6 +184,11 @@ CPU_HYSTERESIS=2000
 # UPSHIFT_CONFIRM 个循环都高于当前档位才升档，默认 2 = 多等一个循环（5 秒）；
 # 1 关闭平滑，恢复"跨阈值立刻升"。降档与回滞不受影响。
 UPSHIFT_CONFIRM=2
+
+# v2.0.0：控制方式。1 = 停掉 pxrfanservice，走厂商正常接口 setfanspeed
+# （不需要 MCU test mode，也就没有"锁被抢"这回事）；0 = 老办法 test mode。
+# 停厂商失败或 setfanspeed 被拒时自动回退到 test mode。见 [15]。
+VENDOR_STOP=1
 
 # Thresholds, in millidegrees C.
 # v1.6 按本机实测重标定（2026-10-31，PICO A8110 + 眼追面捕套件）：这台机器只要
@@ -229,7 +249,7 @@ WAKE_CACHE=""
 # (2) 值里的 $(...) 或反引号会在 source 时被执行（root 下即任意代码执行）。
 # 所以这里逐行解析：先去 CR，只接受已知数值键，拒绝一切非白名单键与含命令
 # 替换的值。实测注入 TOOL=/system/bin/false 或 PWNED=$(touch ...) 都被忽略。
-CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS UPSHIFT_CONFIRM"
+CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS UPSHIFT_CONFIRM VENDOR_STOP"
 
 # 必须是普通文件：-r 对目录/FIFO 也成立，而 read 读目录在 mksh 里不返回，
 # 模块会卡死在启动阶段（实测：config.cfg 被误建成目录 -> --dumpcfg 永久挂起）。
@@ -407,6 +427,7 @@ sanitize_config() {
     _gap=$((_gap - 1)); [ "$_gap" -ge 0 ] || _gap=0
     clamp_int CPU_HYSTERESIS "$CPU_HYSTERESIS" 0 "$_gap" 2000
     clamp_int UPSHIFT_CONFIRM "$UPSHIFT_CONFIRM" 1 10 2
+    clamp_int VENDOR_STOP "$VENDOR_STOP" 0 1 1
 }
 
 log() {
@@ -461,15 +482,39 @@ run_tool() {
     rm -f "$_of" 2>/dev/null
 }
 
+# 当前由谁控制风扇：vendor / test / 空（没接管）。
+fan_owner() {
+    cat "$CTRL_MODE" 2>/dev/null
+}
+
+# v2：正常接口 setfanspeed，test mode 回退时用 setfantestspeed。
+_duty_cmd() {
+    case "$(fan_owner)" in
+        test) echo setfantestspeed ;;
+        *)    echo setfanspeed ;;
+    esac
+}
+
 set_duty() {
     # $1 = duty percent 0-100
     [ "$1" -ge 0 ] 2>/dev/null || return 1
     [ "$1" -le 100 ] 2>/dev/null || return 1
-    out="$(run_tool setfantestspeed "$1")"
+    out="$(run_tool "$(_duty_cmd)" "$1")"
     case "$out" in
         *success*) return 0 ;;
         *)         return 1 ;;
     esac
+}
+
+# 成功写入后统一记账（两种控制方式共用）。
+record_ok() {
+    fail_streak=0
+    got=$(get_duty 2)
+    cur_duty_written="$1"
+    echo "$1" > "$CUR_DUTY"
+    echo "$2" > "$CUR_TIER"
+    date +%s > "$LAST_OK" 2>/dev/null
+    log "$_src rpm ${rpm_now:-?} -> $2 duty $1 [$gate] (reported ${got:-?}, owner $(fan_owner))"
 }
 
 get_duty() {
@@ -499,12 +544,50 @@ get_rpm() {
 }
 
 # ---------------------------------------------------------------------------
-# Test mode (the MCU-side lock)
+# Fan ownership
+#
+# v2.0.0 的主路径：停掉 pxrfanservice，然后用厂商自己的 setfanspeed 接口调速。
+# 这样没有 MCU test mode，也就没有"锁被原厂重置掉"这回事。停不掉或接口被拒时
+# 回退到 test mode（v1.x 的行为），保证任何情况下都有人控制风扇。
 # ---------------------------------------------------------------------------
 
+vendor_running() {
+    [ "$(getprop init.svc.pxrfanservice 2>/dev/null)" = "running" ]
+}
+
+# 停厂商服务并等 init 真正把进程收掉。SELinux 在本机是 Permissive，
+# 模块进程 u:r:magisk:s0，ctl.stop 实测可用。
+stop_vendor() {
+    vendor_running || return 0
+    setprop ctl.stop pxrfanservice 2>/dev/null
+    _vn=0
+    while [ "$_vn" -lt 8 ]; do
+        vendor_running || return 0
+        sleep 1
+        _vn=$((_vn + 1))
+    done
+    return 1
+}
+
+start_vendor() {
+    vendor_running && return 0
+    setprop ctl.start pxrfanservice 2>/dev/null
+    # state 属性只用于和 init 的触发规则保持一致；ctl.start 才是真正生效的那个。
+    if [ "$(getprop "$VENDOR_PROP_STATE" 2>/dev/null)" != "1" ]; then
+        setprop "$VENDOR_PROP_STATE" 1 2>/dev/null
+    fi
+    _vn=0
+    while [ "$_vn" -lt 15 ]; do
+        vendor_running && [ "$_vn" -ge 2 ] && return 0
+        sleep 1
+        _vn=$((_vn + 1))
+    done
+    log "WARN: pxrfanservice did not come back after start"
+    return 1
+}
+
 enter_test_mode() {
-    # 修 [1]：原来这里只要 $IN_TEST 存在就直接 return 0，从不问 MCU。
-    # 标记文件不可信 —— 每次都实际下发一次，幂等且廉价。
+    # 修 [1]：标记文件不可信 —— 每次都实际下发一次，幂等且廉价。
     out="$(run_tool setfantestmode 1)"
     case "$out" in
         *success*) : > "$IN_TEST"; return 0 ;;
@@ -512,23 +595,59 @@ enter_test_mode() {
     esac
 }
 
-# Exit test mode AND force the vendor to re-handshake with the MCU, because the
-# lock does not clear on exit alone. Restarting pxrfanservice makes the MCU
-# accept vendor duty frames again.
 exit_test_mode() {
     rm -f "$IN_TEST"
     run_tool setfantestmode 0 >/dev/null 2>&1
-    setprop sys.pxrfanservice.state 2
-    # 同样不能用 n（会覆盖 main 的循环计数器），见 get_duty 里的说明。
-    _en=0
-    while [ "$_en" -lt 15 ]; do
-        s=$(getprop init.svc.pxrfanservice 2>/dev/null)
-        [ "$s" = "running" ] && [ "$_en" -ge 3 ] && return 0
-        sleep 1
-        _en=$((_en + 1))
-    done
-    log "vendor re-handshake did not complete"
+    start_vendor
+}
+
+# 取得控制权。优先"停厂商 + 正常接口"，失败再退回 test mode。
+take_over() {
+    rm -f "$OWNED" "$CTRL_MODE"
+    if [ "$VENDOR_STOP" = "1" ]; then
+        # 从 v1.x 升级上来时可能残留 test mode：先退出，否则 setfanspeed 会被拒。
+        if [ -f "$IN_TEST" ]; then
+            run_tool setfantestmode 0 >/dev/null 2>&1
+            rm -f "$IN_TEST"
+        fi
+        if stop_vendor; then
+            echo vendor > "$CTRL_MODE"
+            : > "$OWNED"
+            ensure_watchdog
+            return 0
+        fi
+        log "WARN: cannot stop pxrfanservice, falling back to MCU test mode"
+    fi
+    if enter_test_mode; then
+        echo test > "$CTRL_MODE"
+        : > "$OWNED"
+        ensure_watchdog
+        return 0
+    fi
+    rm -f "$OWNED" "$CTRL_MODE"
     return 1
+}
+
+# 交还原厂：先退 test mode（如果用的回退路径），再确保 vendor 服务在跑。
+release_control() {
+    _mode=$(fan_owner)
+    rm -f "$OWNED" "$CTRL_MODE"
+    if [ "$_mode" = "test" ] || [ -f "$IN_TEST" ]; then
+        run_tool setfantestmode 0 >/dev/null 2>&1
+        rm -f "$IN_TEST"
+    fi
+    start_vendor
+}
+
+# 守护被 kill -9 时不会执行 trap，风扇会停在最后的 duty 上。watchdog 负责兜底：
+# 发现 owned 还在但 service.pid 已经死了，就恢复厂商服务。
+ensure_watchdog() {
+    [ -f "$WATCHDOG" ] || return 0
+    _wp=$(cat "$WATCHDOG_PID" 2>/dev/null)
+    [ -n "$_wp" ] && kill -0 "$_wp" 2>/dev/null && return 0
+    nohup sh "$WATCHDOG" >/dev/null 2>&1 &
+    echo $! > "$WATCHDOG_PID" 2>/dev/null
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -797,20 +916,20 @@ should_reengage() {
 
 # 原名 enable —— 与 POSIX 同名内建冲突（shellcheck SC3044），改名。
 enable_control() {
-    if ! enter_test_mode; then
+    if ! take_over; then
         return 1
     fi
     rm -f "$DISABLED" "$GAVE_UP"
     : > "$ENABLED"
-    log "MCU test mode engaged, vendor duty writes now rejected"
+    log "fan ownership acquired (owner $(fan_owner))"
     return 0
 }
 
 disable() {
     : > "$DISABLED"     # 修 [5]：持久化"用户关闭"，重启后不自动接管
     rm -f "$ENABLED"
-    exit_test_mode
-    log "MCU test mode exited, vendor fan policy restored (persistent)"
+    release_control
+    log "fan ownership released, vendor fan policy restored (persistent)"
     return 0
 }
 
@@ -874,6 +993,12 @@ main() {
 
     # 修 [5]：用户显式关过 -> 不接管，等 action.sh enable 撤销。
     if [ -f "$DISABLED" ]; then
+        # 上一轮如果是被 kill -9 打断的，厂商可能还停着。关闭状态下必须让它回来。
+        if [ ! -f "$OWNED" ] && ! vendor_running; then
+            log "disabled state: restoring pxrfanservice"
+            start_vendor
+        fi
+        rm -f "$OWNED" "$CTRL_MODE" 2>/dev/null
         log "disabled by user, standing by (action.sh enable to re-enable)"
         while [ -f "$DISABLED" ]; do
             sleep 10
@@ -883,14 +1008,18 @@ main() {
 
     if is_enabled; then
         log "resuming: previous session ended with module control active"
-        enter_test_mode
+        if ! take_over; then
+            log "ERROR: failed to take over the fan"
+            return 1
+        fi
     else
+        # 从 v1.x 升级：可能残留 test mode 标记，先退出再按新方式接管。
         if [ -f "$IN_TEST" ]; then
             log "found stale test-mode flag, exiting test mode to restore vendor"
             exit_test_mode
         fi
         if ! enable_control; then
-            log "ERROR: failed to enter test mode"
+            log "ERROR: failed to take over the fan"
             return 1
         fi
     fi
@@ -931,26 +1060,41 @@ main() {
         # Overheat: hand the fan back to the vendor so its high-temp protection
         # runs. 修 [4]：这次要真的交回一段时间，见下面重新接管的闸门。
         if [ "$tier" = "OVERHEAT" ] && [ "$OVERHEAT_HANDBACK" = "1" ]; then
-            if [ -f "$IN_TEST" ]; then
-                exit_test_mode
+            if [ -f "$OWNED" ]; then
+                release_control
                 cur_duty_written=""
-                log "$_src over heat, MCU test mode exited, vendor policy restored"
+                log "$_src over heat, fan handed back to vendor"
             fi
             sleep "$LOOP_INTERVAL"
             continue
         fi
 
-        # 掉出 test mode 时重新接管。修 [4]：过热交回后必须等温度降回
+        # 控制权丢失时重新接管。修 [4]：过热交回后必须等温度降回
         # OVERHEAT_RELEASE_RANK 档，避免刚交回 5 秒就抢回来。
-        if [ ! -f "$IN_TEST" ]; then
+        if [ ! -f "$OWNED" ]; then
             if should_reengage "$tier"; then
-                if enter_test_mode; then
-                    log "re-engaged MCU test mode at $_src"
+                if take_over; then
+                    log "fan ownership re-acquired ($(fan_owner)) at $_src"
                     cur_duty_written=""
                 fi
             else
                 sleep "$LOOP_INTERVAL"
                 continue
+            fi
+        fi
+
+        # v2：厂商服务可能被系统某些组件重新拉起。停止它，并强制下一轮重写
+        # duty —— 否则外面看起来一直是我们的档位，实际原厂已经在写自己的值。
+        if [ "$(fan_owner)" = "vendor" ] && vendor_running; then
+            log "pxrfanservice was restarted, stopping it again"
+            if stop_vendor; then
+                cur_duty_written=""
+            else
+                log "WARN: cannot stop pxrfanservice, falling back to MCU test mode"
+                if enter_test_mode; then
+                    echo test > "$CTRL_MODE"
+                    cur_duty_written=""
+                fi
             fi
         fi
 
@@ -971,41 +1115,37 @@ main() {
         # Only touch the fan when the desired duty actually changes.
         if [ "$desired" != "$cur_duty_written" ]; then
             if set_duty "$desired"; then
-                fail_streak=0
-                got=$(get_duty 2)
-                cur_duty_written="$desired"
-                echo "$desired" > "$CUR_DUTY"
-                echo "$cur_tier_name" > "$CUR_TIER"
-                date +%s > "$LAST_OK" 2>/dev/null
-                log "$_src rpm ${rpm_now:-?} -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
+                record_ok "$desired" "$cur_tier_name"
             else
-                # 修 [1] 的核心：写入被拒 == MCU 那边锁已经没了，标记文件不可信。
                 fail_streak=$((fail_streak + 1))
                 if [ $((fail_streak % FAIL_LOG_EVERY)) -eq 1 ]; then
-                    log "setfantestspeed $desired rejected (streak $fail_streak), re-arming MCU test mode"
+                    log "set duty $desired rejected (streak $fail_streak, owner $(fan_owner))"
                 fi
-                rm -f "$IN_TEST"
-                if enter_test_mode; then
-                    if set_duty "$desired"; then
-                        fail_streak=0
-                        got=$(get_duty 2)
-                        cur_duty_written="$desired"
-                        echo "$desired" > "$CUR_DUTY"
-                        echo "$cur_tier_name" > "$CUR_TIER"
-                        date +%s > "$LAST_OK" 2>/dev/null
-                        log "re-armed ok: $_src -> $cur_tier_name duty $desired [$gate] (reported ${got:-?})"
+                if [ "$(fan_owner)" = "vendor" ]; then
+                    # 正常接口被拒：最常见的原因是厂商服务又回来了。再停一次重试；
+                    # 还不行就退回 test mode，保证风扇始终有人控制。
+                    if stop_vendor && set_duty "$desired"; then
+                        record_ok "$desired" "$cur_tier_name"
+                    elif enter_test_mode && { echo test > "$CTRL_MODE"; set_duty "$desired"; }; then
+                        log "vendor API unavailable, switched to MCU test mode"
+                        record_ok "$desired" "$cur_tier_name"
+                    fi
+                else
+                    # 修 [1] 的核心：写入被拒 == MCU 那边的锁已经没了。
+                    rm -f "$IN_TEST"
+                    if enter_test_mode && set_duty "$desired"; then
+                        record_ok "$desired" "$cur_tier_name"
                     fi
                 fi
 
-                # 放弃阈值：写入持续被拒说明这一轮拿不到控制权（固件变更 /
-                # 权限丢失 / MCU 异常）。再重试下去只会让 MCU 一直卡在 test
-                # mode —— 厂商的 duty 帧同样被拒，风扇没人管，而 state 里
-                # 还写着"本模块温控"。到上限就退出 test mode 交还原厂。
-                if [ "$fail_streak" -ge "$MAX_FAIL_STREAK" ]; then
+                # 放弃阈值：仍然写不进去说明这一轮拿不到控制权（固件变更 /
+                # 权限丢失 / MCU 异常）。到上限就交还原厂，不能留下"没人管"的风扇。
+                if [ "$cur_duty_written" != "$desired" ] \
+                   && [ "$fail_streak" -ge "$MAX_FAIL_STREAK" ]; then
                     log "ERROR: $fail_streak consecutive rejections, giving up and handing back to vendor"
                     : > "$GAVE_UP" 2>/dev/null
                     rm -f "$ENABLED" 2>/dev/null
-                    exit_test_mode
+                    release_control
                     return 1
                 fi
                 sleep "$RETRY_BACKOFF"
@@ -1013,23 +1153,31 @@ main() {
         fi
 
         # 每 ~6 个循环（约 30s）校验一次持有值。漂移了就重写。
-        # 修 [11]：重写失败必须当成"MCU 侧锁丢了"处理 —— 这里原来把返回值吞了，
-        # 于是 cur_duty 一直显示 88 而硬件早回落到原厂转速，模块变成僵尸还在跑。
-        # 实测（2026-10-31）：厂商重新握手后注入故障，本分支 1 秒内完成
-        # drift -> 判定丢锁 -> re-arm -> 恢复 88%，并在日志里留痕。
+        # v2：厂商服务被拉起时也会走到这里（原厂写的 duty 与我们的意图不同）。
         want="$cur_duty_written"
         [ -n "$want" ] || [ ! -f "$ENABLED" ] || want=$(cat "$CUR_DUTY" 2>/dev/null)
         if [ $((n % 6)) -eq 0 ] && [ -n "$want" ]; then
             held=$(get_duty 2)
             if [ -n "$held" ] && [ "$held" != "$want" ]; then
-                log "drift: MCU reports duty $held, want $want, re-asserting"
+                log "drift: fan reports duty $held, want $want, re-asserting"
                 if ! set_duty "$want"; then
-                    log "re-assert rejected -> MCU test-mode lock presumed lost, re-arming"
-                    rm -f "$IN_TEST"
-                    if enter_test_mode && set_duty "$want"; then
-                        log "re-armed and duty $want restored"
+                    if [ "$(fan_owner)" = "vendor" ]; then
+                        log "re-assert rejected, re-stopping pxrfanservice"
+                        if stop_vendor && set_duty "$want"; then
+                            log "duty $want restored"
+                        elif enter_test_mode && { echo test > "$CTRL_MODE"; set_duty "$want"; }; then
+                            log "switched to MCU test mode, duty $want restored"
+                        else
+                            log "ERROR: cannot hold fan duty $want"
+                        fi
                     else
-                        log "ERROR: cannot hold fan duty $want (test mode unavailable)"
+                        log "re-assert rejected -> MCU test-mode lock presumed lost, re-arming"
+                        rm -f "$IN_TEST"
+                        if enter_test_mode && set_duty "$want"; then
+                            log "re-armed and duty $want restored"
+                        else
+                            log "ERROR: cannot hold fan duty $want (test mode unavailable)"
+                        fi
                     fi
                 fi
             fi
@@ -1054,6 +1202,7 @@ selftest() {
     CUR_TIER="$CT"
     CG="$TMP/chg"
     CHG_TEMP_NODE="$CG"
+    CTRL_MODE="$TMP/ctrl_mode"
     WF="$TMP/wake"
     WAKE_SRC="$WF"
     # 默认让所有假 CPU 热区都是 70C（低于 CPU0），不影响上面的皮肤/充电测试。
@@ -1108,6 +1257,7 @@ selftest() {
     echo "  充电IC阈值: $CHG0/$CHG1/$CHG2/$CHG3/$CHG4 回滞=$CHG_HYSTERESIS"
     echo "  CPU阈值: $CPU0/$CPU1/$CPU2/$CPU3/$CPU4 回滞=$CPU_HYSTERESIS 启用=$CPU_ENABLE zones=$CPU_ZONES"
     echo "  升档平滑: UPSHIFT_CONFIRM=$UPSHIFT_CONFIRM（1=关闭，只影响上冲）"
+    echo "  控制方式: VENDOR_STOP=$VENDOR_STOP（1=停厂商+setfanspeed，0=test mode）"
     echo "  熄屏压档: SCREEN_OFF_MAX_RANK=$SCREEN_OFF_MAX_RANK 刷新间隔=$WAKE_DUMP_INTERVAL 圈"
     echo "  非法值会被夹紧/回落并记日志，用 --dumpcfg 看最终生效值。"
 
@@ -1239,6 +1389,15 @@ selftest() {
     for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
     printf '58000' > "$ST"; printf '450' > "$CG"
     echo ""
+    echo "== [15] 控制方式 -> duty 命令映射 =="
+    rm -f "$CTRL_MODE"
+    echo "  owner=空     -> $(_duty_cmd)（应 setfanspeed）"
+    echo vendor > "$CTRL_MODE"
+    echo "  owner=vendor -> $(_duty_cmd)（应 setfanspeed）"
+    echo test > "$CTRL_MODE"
+    echo "  owner=test   -> $(_duty_cmd)（应 setfantestspeed）"
+    rm -f "$CTRL_MODE"
+    echo ""
     echo "== [11] 漂移校验：写入被拒即判定丢锁并重接管（只读，不在此处触发）=="
     echo "  实测：注入丢锁后 1 秒内 drift -> re-arm -> duty 恢复，见 logcat -s PicoFanTC"
     echo ""
@@ -1258,7 +1417,7 @@ dumpcfg() {
               T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE \
               CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS \
               CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS \
-              UPSHIFT_CONFIRM \
+              UPSHIFT_CONFIRM VENDOR_STOP \
               SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL \
               RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK \
               RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK; do

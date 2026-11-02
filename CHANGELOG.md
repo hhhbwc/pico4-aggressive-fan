@@ -1,5 +1,98 @@
 # Changelog
 
+## v2.0.0
+
+2026-11-02. Architecture rewrite. The v1.x control path fought the vendor for the GD32 MCU
+test-mode lock and lost it repeatedly; v2.0.0 removes the fight entirely.
+
+### Changed
+
+**1. The fan is driven through the vendor's own normal API, with the vendor service stopped.**
+
+The stock fan policy lives in one init service, `pxrfanservice`. Until now the module left it
+running and used PICO's factory-test program to push duty frames the MCU would accept:
+
+```sh
+gd32ipdclient_test setfantestmode 1      # v1.x: lock the MCU out
+gd32ipdclient_test setfantestspeed 55
+```
+
+That lock was fragile. `PxrFanService` logs show it doing a reset on `system_screen_on/off` and
+`system_vrmode_start/stop`, and it re-asserts its own duty (`fanState=35`) roughly every 10 s.
+When the MCU lock dropped, the vendor's next frame won and the module had to rebuild test mode —
+the "控制权老是被抢走" behaviour that made the module feel unreliable.
+
+The vendor's *normal* path is also available: `gd32ipdclient_test setfanspeed N` calls
+`gd32ipdservice.SetFanSpeed`, exactly what `pxrfanservice` itself uses. Measured on the author's
+unit:
+
+| | v1.x test mode | v2.0.0 vendor-stop + `setfanspeed` |
+|---|---|---|
+| Vendor service | running, writes every ~10 s | stopped once at takeover |
+| Duty held | rejected once the MCU lock dropped | stable |
+| Vendor restart (screen on/off) | re-asserts its own duty | watchdog stops it again |
+| Recovery needed after a steal | ~15 s to re-arm | none — no competitor |
+
+The module now stops `pxrfanservice` at takeover (`setprop ctl.stop pxrfanservice`; the module
+process runs in `u:r:magisk:s0` and SELinux is permissive on this device, so this is permitted)
+and writes duty with `setfanspeed`. **There is no MCU lock, so there is nothing to lose and
+nothing to re-assert.**
+
+Verified on-device: duty 80% stayed at 80% / ~12600–12900 RPM for 90 s with the vendor stopped;
+`setfanspeed` responded immediately to 30% and 0%; the service stayed stopped across screen
+on/off; under load the module ramped 0% → 25% → 88% with the vendor stopped the whole time and
+held 88% / ~13400 RPM.
+
+**2. Automatic fallback to the old path.**
+
+If `pxrfanservice` cannot be stopped, or `setfanspeed` is rejected, the module falls back to the
+v1.x MCU test-mode path automatically, so *something* always controls the fan. The active path is
+recorded in `state/ctrl_mode` (`vendor` / `test`) and shown by `action.sh status`. The new config
+key `VENDOR_STOP` (default `1`) forces the old behaviour when set to `0`.
+
+**3. New `watchdog.sh` — the fan is never left uncontrolled.**
+
+Stopping the vendor means a crashed daemon would leave the fan at its last duty with nobody in
+charge. `watchdog.sh` polls every 5 s and covers the case the daemon's own `EXIT` trap cannot:
+`service.sh` killed with `-9`. It restarts `pxrfanservice`, clears the ownership markers and
+exits.
+
+Verified on-device: `kill -9` on the daemon → the watchdog restored the vendor within ~5 s
+(`watchdog: service.sh is gone but fan is still owned, restoring vendor`), the fan went back to
+the vendor's own duty (50% / ~8550 RPM), and the ownership markers were removed. The watchdog also
+stops the vendor again if the system restarts it while the module holds the fan.
+
+Every other exit path already restores the vendor: `action.sh disable`, uninstall (`stop.sh`),
+giving up after `MAX_FAIL_STREAK` rejected writes, and the daemon's `EXIT` trap.
+
+**4. `stop.sh` now kills the watchdog too.**
+
+Uninstall killed the daemon but left the watchdog running; the watchdog then saw a missing
+ownership marker and exited on its own, but only after up to 5 s. It is now stopped explicitly.
+
+### Added
+
+- New config key `VENDOR_STOP` (0/1, default 1).
+- New file `watchdog.sh`, installed and chmod'ed by `customize.sh`.
+- `action.sh status` shows the control method in use (`厂商服务已停 + setfanspeed` vs
+  `MCU test mode (回退)`) next to the live `vendor=running|stopped` state.
+- `--selftest` case [15]: the owner → duty-command mapping (`vendor` → `setfanspeed`,
+  `test` → `setfantestspeed`).
+
+### Unchanged
+
+Everything about the temperature side is the same: three sources (skin / charger IC / CPU-SoC),
+the tier ladder and its duties, the hysteresis, the screen-off clamp, the RPM gate, the upshift
+smoothing, and the config validation. The tiers, thresholds and measured RPM values in the README
+are unchanged.
+
+### Upgrade notes
+
+- Flashing the release zip replaces the module directory, including `config.cfg`. Back up a
+  customised `config.cfg` first.
+- After upgrading, the module exits any stale MCU test mode left over from v1.x before taking
+  over — otherwise `setfanspeed` would be rejected.
+
 ## v1.7.0
 
 2026-11-02. Player feedback: after upgrading to v1.6 the fan felt *worse* — at CPU 90°C
@@ -66,7 +159,8 @@ else drops the line.
 
 **7. A `config.cfg` that was not a regular file hung the daemon.**
 
-`[ -r ]` is true for a directory, and `tr -d '' < dir` spins forever on EISDIR (observed on
+`[ -r ]` is true for a directory, and `tr -d '
+' < dir` spins forever on EISDIR (observed on
 device: two `tr` processes at 100% CPU, `--dumpcfg` never returning). Both scripts now require
 `[ -f ]` before reading the config.
 

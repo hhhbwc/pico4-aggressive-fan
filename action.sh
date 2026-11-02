@@ -30,6 +30,8 @@ CONFIG_FILE="$MODDIR/config.cfg"
 ENABLED="$STATE_DIR/enabled"
 DISABLED="$STATE_DIR/disabled"
 IN_TEST="$STATE_DIR/in_test"
+OWNED="$STATE_DIR/owned"
+CTRL_MODE="$STATE_DIR/ctrl_mode"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
 PINNED="$STATE_DIR/pinned"
@@ -51,6 +53,7 @@ CHG0=60000; CHG1=65000; CHG2=70000; CHG3=75000; CHG4=79000; CHG_HYSTERESIS=1500
 CPU_ENABLE=1; CPU_ZONES="1,2,3,4,7,8,9,10,11"
 CPU0=78000; CPU1=81000; CPU2=84000; CPU3=87000; CPU4=90000; CPU_HYSTERESIS=2000
 UPSHIFT_CONFIRM=2
+VENDOR_STOP=1
 SCREEN_OFF_MAX_RANK=1; WAKE_DUMP_INTERVAL=6
 RPM_CAP=12000; RPM_DUTY=88; RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
@@ -78,7 +81,8 @@ CMD="${1:-auto}"
 ARG="${2:-}"
 
 in_test_mode() {
-    [ -f "$IN_TEST" ]
+    # v2：控制权标记从 in_test 换成 owned（两种控制方式共用）。
+    [ -f "$OWNED" ]
 }
 
 vendor_running() {
@@ -133,27 +137,79 @@ ensure_service() {
     return 0
 }
 
-take_over() {
-    out=$($TOOL setfantestmode 1 2>/dev/null)
-    case "$out" in
-        *success*) : > "$IN_TEST"; return 0 ;;
-        *)         return 1 ;;
+# v2：owner=vendor 时用厂商正常接口，owner=test 时用 test mode 接口。
+is_owned() {
+    [ -f "$OWNED" ]
+}
+
+owner() {
+    cat "$CTRL_MODE" 2>/dev/null
+}
+
+duty_cmd() {
+    case "$(owner)" in
+        test) echo setfantestspeed ;;
+        *)    echo setfanspeed ;;
     esac
 }
 
-hand_back() {
-    rm -f "$IN_TEST" "$PINNED"
-    $TOOL setfantestmode 0 >/dev/null 2>&1
-    # The MCU-side lock does not clear on exit alone; restarting pxrfanservice
-    # forces the re-handshake that makes the MCU accept vendor duty frames.
-    setprop sys.pxrfanservice.state 2
+stop_vendor() {
+    vendor_running || return 0
+    setprop ctl.stop pxrfanservice 2>/dev/null
     n=0
-    while [ "$n" -lt 15 ]; do
-        vendor_running && [ "$n" -ge 3 ] && return 0
+    while [ "$n" -lt 8 ]; do
+        vendor_running || return 0
         sleep 1
         n=$((n + 1))
     done
     return 1
+}
+
+start_vendor() {
+    vendor_running && return 0
+    setprop ctl.start pxrfanservice 2>/dev/null
+    [ "$(getprop sys.pxrfanservice.state 2>/dev/null)" = "1" ] \
+        || setprop sys.pxrfanservice.state 1 2>/dev/null
+    n=0
+    while [ "$n" -lt 15 ]; do
+        vendor_running && [ "$n" -ge 2 ] && return 0
+        sleep 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# 优先停厂商走正常接口；失败再退回 test mode。与 service.sh 的 take_over 同逻辑。
+take_over() {
+    rm -f "$OWNED" "$CTRL_MODE"
+    if [ "${VENDOR_STOP:-1}" = "1" ]; then
+        if [ -f "$IN_TEST" ]; then
+            $TOOL setfantestmode 0 >/dev/null 2>&1
+            rm -f "$IN_TEST"
+        fi
+        if stop_vendor; then
+            echo vendor > "$CTRL_MODE"
+            : > "$OWNED"
+            return 0
+        fi
+    fi
+    out=$($TOOL setfantestmode 1 2>/dev/null)
+    case "$out" in
+        *success*) : > "$IN_TEST"; echo test > "$CTRL_MODE"; : > "$OWNED"; return 0 ;;
+        *)         rm -f "$OWNED" "$CTRL_MODE"; return 1 ;;
+    esac
+}
+
+hand_back() {
+    _m=$(owner)
+    rm -f "$OWNED" "$CTRL_MODE" "$PINNED"
+    if [ "$_m" = "test" ] || [ -f "$IN_TEST" ]; then
+        $TOOL setfantestmode 0 >/dev/null 2>&1
+        rm -f "$IN_TEST"
+    fi
+    # v2：停厂商时不需要 MCU 重握手；start_vendor 会把原厂策略原样接回来。
+    start_vendor
+    return $?
 }
 
 pin_duty() {
@@ -162,11 +218,11 @@ pin_duty() {
     [ "$1" -le 100 ] 2>/dev/null || { echo "无效 duty: $1"; return 1; }
     if ! in_test_mode; then
         if ! take_over; then
-            echo "开启 test mode 失败"
+            echo "接管风扇失败"
             return 1
         fi
     fi
-    out=$($TOOL setfantestspeed "$1" 2>/dev/null)
+    out=$($TOOL "$(duty_cmd)" "$1" 2>/dev/null)
     case "$out" in
         *success*) echo "$1" > "$PINNED"; rm -f "$DISABLED"; echo "已固定 duty=$1%" ;;
         *) echo "固定失败"; return 1 ;;
@@ -214,9 +270,9 @@ cycle_step() {
     esac
 
     if ! in_test_mode; then
-        take_over || { echo "test mode 失败"; return 1; }
+        take_over || { echo "接管风扇失败"; return 1; }
     fi
-    out=$($TOOL setfantestspeed "$d" 2>/dev/null)
+    out=$($TOOL "$(duty_cmd)" "$d" 2>/dev/null)
     case "$out" in
         *success*) echo "已切到 $next 档 (duty=$d%)"
                    rm -f "$DISABLED"
@@ -253,6 +309,7 @@ tier_table() {
         "${CPU0:-78000}" "${CPU1:-81000}" "${CPU2:-84000}" "${CPU3:-87000}" "${CPU4:-90000}" \
         "${CPU_HYSTERESIS:-2000}" "${CPU_ENABLE:-1}"
     printf "  升档平滑: 连续 %s 个循环确认（1=关闭，只影响上冲）\n" "${UPSHIFT_CONFIRM:-2}"
+    printf "  控制方式: VENDOR_STOP=%s（1=停厂商+setfanspeed，0=MCU test mode）\n" "${VENDOR_STOP:-1}"
     _wk=$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
     printf "  熄屏压档: 上限档=%s (0=QUIET 1=IDLE 2=WARM … -1=关闭) | 当前 mWakefulness=%s\n" \
         "${SCREEN_OFF_MAX_RANK:--1}" "${_wk:-?}"
@@ -279,15 +336,15 @@ status() {
         echo "模式: 已关闭 (持久，重启保持) — vendor 控制，action.sh enable 可恢复"
     elif is_pinned; then
         if in_test_mode; then
-            echo "模式: 手动固定 (duty=$(cat "$PINNED")%)"
+            echo "模式: 手动固定 (duty=$(cat "$PINNED")%，owner=$(owner))"
         else
-            echo "模式: 手动固定记录存在，但 MCU test mode 未生效 (风扇归 vendor)"
+            echo "模式: 手动固定记录存在，但风扇没有真正被接管 (归 vendor)"
         fi
     elif in_test_mode; then
         if [ -f "$ENABLED" ]; then
-            echo "模式: 本模块温控 (duty 由「皮肤温度」「充电 IC NTC」「CPU/SoC 热区」三者较高档决定)"
+            echo "模式: 本模块温控 (owner=$(owner)；duty 由三路温度取最高档决定)"
         else
-            echo "模式: MCU test mode 已开，但 service.sh 未运行"
+            echo "模式: 风扇已接管，但 service.sh 未运行"
         fi
     elif vendor_running; then
         echo "模式: 原厂温控 (PICO 自带策略)"
@@ -311,7 +368,14 @@ status() {
     if [ -n "$tp" ]; then tp_c="$((tp / 1000))"; else tp_c="?"; fi
     printf "温度源: 皮肤 %s°C | 充电IC %s°C | CPU %s°C\n" "$t_c" "$tc" "$tp_c"
     printf "风扇: duty=%s%% rpm=%s\n" "${d:-?}" "${r:-?}"
-    printf "vendor=%s | 当前档=%s (上次写入 duty=%s)\n" "${v:-?}" "$cur_tier" "$cur_duty"
+    _own=$(owner)
+    case "$_own" in
+        vendor) _how="厂商服务已停 + setfanspeed (无 test mode)" ;;
+        test)   _how="MCU test mode (回退)" ;;
+        *)      _how="未接管" ;;
+    esac
+    echo "控制方式: $_how | vendor=${v:-?}"
+    echo "当前档=$cur_tier (上次写入 duty=$cur_duty)"
     [ -n "$svc" ] && printf "service.sh PID=%s\n" "$svc"
     # 最后一次成功写入风扇的时间。模块"看起来在跑"但这个值一直不更新，
     # 就说明它其实没有控制权 —— 这是排查静默失灵最有用的一行。

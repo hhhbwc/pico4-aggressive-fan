@@ -25,7 +25,7 @@ norm_lf() {
     return 0
 }
 
-for f in service.sh stop.sh action.sh config.cfg customize.sh module.prop; do
+for f in service.sh stop.sh action.sh watchdog.sh config.cfg customize.sh module.prop; do
     norm_lf "$MODPATH/$f"
 done
 
@@ -34,15 +34,13 @@ done
 chmod 755 "$MODPATH/service.sh" 2>/dev/null
 chmod 755 "$MODPATH/stop.sh" 2>/dev/null
 chmod 755 "$MODPATH/action.sh" 2>/dev/null
+chmod 755 "$MODPATH/watchdog.sh" 2>/dev/null
 
-ui_print "- PICO 4 Fan Auto Temp Control v1.6.0"
+ui_print "- PICO 4 Fan Auto Temp Control v2.0.0"
 ui_print "- 风扇自动温控模块已安装"
-ui_print "- 修复：标记文件误判致模块失灵 / RPM 升速永久自锁 / 回滞未实现"
-ui_print "- 修复：disable 不持久 / 过热交回只维持 5 秒 / 无超时看门狗"
-ui_print "- 修复：持续失败不交还原厂 / 卸载后循环仍在跑 / 配置无校验"
-ui_print "- v1.5.0 实机修复：config.cfg 任意代码执行 / 看门狗对脚本工具失效"
-ui_print "- v1.6.0 新功能：充电 IC 温度源合流 / 过热档不再交回原厂 / 熄屏压档 / 丢锁自愈"
-ui_print "- v1.6.0 修掉：皮肤阈值按本机重标定（醒着就 57-61C，旧阈值导致整天 88%）"
+ui_print "- v2.0.0 重写控制方式：停掉 pxrfanservice，用厂商正常接口 setfanspeed 调速"
+ui_print "- 不再和原厂抢 MCU test mode；停不掉时自动回退，watchdog 兜底恢复厂商"
+ui_print "- 控制：三路温度取最高档 / 升档平滑 / 熄屏压档 / 回滞"
 ui_print "- 详见 CHANGELOG.md"
 
 exit 0
