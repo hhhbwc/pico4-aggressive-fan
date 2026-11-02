@@ -332,8 +332,8 @@ restart_service() {
     kill_service
     rm -f "$GAVE_UP" 2>/dev/null
     nohup sh "$SVC" >/dev/null 2>&1 &
-    # 守护要等 boot_completed + STARTUP_GRACE 才写 pid 文件，这里最多等 8 秒，
-    # 避免把"还在 grace 期"误报成"重启失败"。
+    # service.sh 在进入 STARTUP_GRACE 之前就写 pid 文件，正常几秒内能看到。
+    # 等 8 秒仍没有才判定失败（实测宽限期放在写 pid 之后，不会误报）。
     new=""
     for _i in 1 2 3 4 5 6 7 8; do
         sleep 1

@@ -105,6 +105,8 @@ CPU/SoC tiers (`CPU0..CPU4`, default 78/81/84/87/90°C):
 
 Downshifting requires every available source to be cool: skin below `threshold − HYSTERESIS` (0.8°C), charger IC below `threshold − CHG_HYSTERESIS` (1.5°C) and CPU below `threshold − CPU_HYSTERESIS` (2°C). If a source is missing or returns `-22`, it drops out and the others still control the fan.
 
+Measured on an A8110 (2026-11-02) with eight busy loops: CPU 94–95°C → overheat 88% / 12465→13656 RPM, while the skin in the same window read only 52–57°C (which the v1.6 two-source logic kept at 25%).
+
 Measured duty → RPM curve on a PICO A8110:
 
 | duty | 0% | 15% | 20% | 25% | 30% | 35% | 45% | 65% | 78% | 88% |
@@ -405,6 +407,8 @@ CPU/SoC 档（`CPU0..CPU4`，默认 78/81/84/87/90°C）：
 
 降档时所有可用温度源都要凉下来：皮肤低于「档位阈值 − `HYSTERESIS`」（默认 0.8°C），充电 IC 低于「阈值 − `CHG_HYSTERESIS`」（默认 1.5°C），CPU 低于「阈值 − `CPU_HYSTERESIS`」（默认 2°C）。某一节点读不到或返回 `-22` 时该路自动退出，其余源继续控温。
 
+本机实测（A8110，2026-11-02，8 核满载）：CPU 94–95°C → 过热 88% / 12465→13656 RPM；同一时刻皮肤只有 52–57°C，v1.6 的两源逻辑会停在 25%。
+
 PICO A8110 实测 duty → RPM 曲线：
 
 | duty | 0% | 15% | 20% | 25% | 30% | 35% | 45% | 65% | 78% | 88% |
@@ -698,6 +702,8 @@ Duty, записанный через `setfantestspeed`, не затрагива
 | ≥ 90°C | перегрев | 88% |
 
 Для понижения должны остыть все доступные источники: кожа ниже `порог − HYSTERESIS` (0.8°C), ИС зарядки ниже `порог − CHG_HYSTERESIS` (1.5°C), CPU ниже `порог − CPU_HYSTERESIS` (2°C). Если узел недоступен или возвращает `-22`, этот источник отключается, а остальные продолжают управлять вентилятором.
+
+Измерено на A8110 (2026-11-02) при восьми нагрузочных циклах: CPU 94–95°C → перегрев 88% / 12465→13656 RPM, при этом кожа в том же окне показывала всего 52–57°C (логика v1.6 с двумя источниками держала бы 25%).
 
 Измеренная кривая duty → RPM на PICO A8110:
 

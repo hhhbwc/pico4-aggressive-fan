@@ -19,6 +19,11 @@
 降档要求三路都凉下来（CPU 回滞 2°C）；熄屏压档的「真烫」豁免也加入 CPU ≥ 87°C。
 坏节点/负值自动跳过。`CPU_ENABLE=0` 可退回 v1.6 的双源行为。
 
+**`action.sh restart` 每次都误报「重启失败」。**
+`service.sh` 原来要等 `boot_completed` + `STARTUP_GRACE`（45 秒）才写 `state/service.pid`，
+而 `action.sh restart` 只等 8 秒，于是手动重启必然打印失败、其实进程正在启动。本版实机测试
+时踩到；现在 pid 在宽限期之前注册，restart 约 1 秒即可确认。
+
 ### Added
 
 - 新键 `CPU_ENABLE`、`CPU_ZONES`、`CPU0..CPU4`、`CPU_HYSTERESIS`。
@@ -38,6 +43,17 @@
 | skin-msm-therm-usr (zone86) | 73.8°C |
 
 同一时刻皮肤仍低 10°C 左右，这正是 v1.6 在 CPU 90°C 时只给 55% 的原因。
+
+### 实机验证（2026-11-02，A8110）
+
+- 设备 mksh 下 `sh -n`、`--dumpcfg`、`--selftest`（含 [13]）全部通过。
+- 8 核满载：最热 CPU 热区 94–95°C → OVERHEAT 88%，RPM 12465→13656；同一窗口皮肤只有
+  52–57°C，v1.6 两源逻辑会停在 IDLE 25%（约 4800 RPM）——用户反馈的问题原始复现并修正。
+- 撤负载：CPU 87°C → VERYHOT 78% / 12220 RPM，随后逐档回落；熄屏时 CPU 85°C、皮肤
+  58°C 仍按设计压到 IDLE 25%。
+- 醒着、VR 桌面运行：CPU 最高 79–82°C → IDLE 25%。逐秒采样显示 cluster 0 在 67–70°C，
+  `cpu-1-3-usr`（zone 10）会尖峰到 82°C，所以最大值通常由单核决定；该核抖动时档位会在
+  阈值附近上下跳一档，这是「多源取最高」的预期行为，不是滤波缺陷。
 
 ---
 

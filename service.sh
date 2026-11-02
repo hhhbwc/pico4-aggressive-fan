@@ -790,7 +790,6 @@ main() {
     while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ]; do
         sleep 2
     done
-    sleep "$STARTUP_GRACE"
 
     if ! [ -x "$TOOL" ]; then
         log "ERROR: $TOOL missing or not executable, cannot control fan"
@@ -813,6 +812,10 @@ main() {
     fi
     echo $$ > "$PID_FILE" 2>/dev/null
     trap 'rm -f "$PID_FILE" 2>/dev/null' EXIT
+
+    # 宽限期放在注册 pid 之后：进程已经可被 action.sh 看到，不会在 45 秒内
+    # 被误判成"重启失败"（实机验证时踩到过）。
+    sleep "$STARTUP_GRACE"
 
     # 上一次运行如果因写入持续失败而放弃过，新一轮重新尝试。
     rm -f "$GAVE_UP" 2>/dev/null

@@ -41,6 +41,13 @@ A missing/negative zone is skipped, so a dead sensor cannot pin the fan high or 
 The clamp is bypassed when genuinely hot: skin ≥ 69°C, charger IC ≥ 75°C **or CPU ≥ 87°C**
 (previous two only).
 
+**4. `action.sh restart` always printed a failure.**
+
+`service.sh` wrote `state/service.pid` only after `sys.boot_completed` + `STARTUP_GRACE`
+(45 s), but `action.sh restart` waited 8 s — so every manual restart said "重启失败" while the
+daemon was actually starting. Caught during device testing of this release. `service.sh` now
+registers its pid before the grace sleep, and restart confirms in about a second.
+
 ### Added
 
 - `CPU_ENABLE` (default 1), `CPU_ZONES` (default `1,2,3,4,7,8,9,10,11`), `CPU0..CPU4`
@@ -51,6 +58,20 @@ The clamp is bypassed when genuinely hot: skin ≥ 69°C, charger IC ≥ 75°C *
   CPU-driven overheat, CPU hysteresis, `CPU_ENABLE=0`, and the screen-off exemption.
 - Log lines now print all three sources (`skin 65C chg 45C cpu 88C`) instead of skin only.
 - `action.sh status` prints the three temperatures; the tier table shows the CPU thresholds.
+
+### Verified on a real A8110 (2026-11-02)
+
+- `sh -n` under the device's mksh, `--dumpcfg`, and `--selftest` (every case, including [13])
+  all pass with the shipped defaults.
+- 8-core busy loop: hottest CPU zone 94–95°C → OVERHEAT, duty 88%, rpm 12465→13656. Over the
+  same window the skin read 52–57°C, which the v1.6 two-source logic would have kept at
+  IDLE 25% (~4800 rpm) — the reported defect, reproduced and fixed.
+- Load removed: CPU 87°C → VERYHOT 78% / 12220 rpm, then steps back down as it cools. With the
+  screen asleep at CPU 85°C / skin 58°C the clamp held IDLE 25%, as designed.
+- Awake, with the VR home running: CPU max 79–82°C → IDLE 25%. A per-second sample showed
+  cluster 0 at 67–70°C and `cpu-1-3-usr` (zone 10) spiking to 82°C, so the maximum is usually
+  one hot core. The tier can step up/down around a threshold while that core spikes; that is
+  the requested max-of-sources behaviour, not a smoothing bug.
 
 ### Compatibility
 
