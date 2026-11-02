@@ -102,6 +102,32 @@ Both scripts now match on the process's argv instead: a process is only killed w
 script path is one of its own arguments, which is true of the real daemon and false of a
 shell that merely mentions the path. Verified on-device.
 
+### Stress test
+
+Sustained maximum load (8 busy loops, sampled every 5 s) on the author's PICO A8110, with
+the fan control active. 126 samples over ~11 minutes:
+
+| | Result |
+|---|---|
+| Duty | steady 88% (the overheat tier) for 108 consecutive samples |
+| RPM | 13300–13407 |
+| CPU (hottest zone) | peaked at 94.6–95.4°C — **above PICO's own 90°C warning line** |
+| Skin model | settled at ~50.3°C |
+| Charger IC | ~49.7°C |
+| Vendor service | `stopped` for the entire run; `PxrFanService` never even logged |
+| Daemon / watchdog PID | unchanged throughout (15180 / 8705) — neither process restarted |
+| Hardware duty vs module intent | one sample out of 126 differed, and only during an upshift |
+| Tier ladder | monotonic — quiet → idle → very hot → over heat, no oscillation |
+
+The screen was also toggled repeatedly under load (`input keyevent 26`, verified
+`mWakefulness` flipping between `Awake` and `Asleep`). The fan held 88% through every
+toggle, because stopping the vendor removes the vendor's reset path entirely.
+
+One sensor characteristic worth knowing: the CPU thermal-zone reading is **per core**, so when
+the hottest core goes idle its reading can fall 40+°C within 5 s (measured +42.5 °C / −43.6 °C).
+Under a rapidly changing workload the duty therefore tracks a jumping input — the reading is
+bimodal, not the module oscillating. Judge stability from the tier ladder under *steady* load.
+
 ### Added
 
 - New config key `VENDOR_STOP` (0/1, default 1).

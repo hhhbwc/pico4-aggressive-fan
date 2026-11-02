@@ -100,6 +100,31 @@ falls back to the v1.x test-mode path so that *something* always controls the fa
 
 `state/cur_duty` only records the module's last intent — always verify with `getfaninfo`.
 
+### Measured behaviour under sustained maximum load
+
+Eight busy loops on the author's PICO A8110, sampled every 5 s, 126 samples over ~11 minutes:
+
+| | Result |
+|---|---|
+| Duty | steady 88% (overheat tier) for 108 consecutive samples |
+| RPM | 13300–13407 |
+| CPU (hottest zone) | peaked at 94.6–95.4°C — **above PICO's own 90°C warning line** |
+| Skin model | settled at ~50.3°C |
+| Charger IC | ~49.7°C |
+| Vendor service | `stopped` for the entire run — `PxrFanService` never even logged |
+| Daemon / watchdog PID | unchanged throughout (15180 / 8705); neither process restarted |
+| Hardware duty vs module intent | 1 sample out of 126 differed, only during an upshift |
+| Tier ladder | monotonic — quiet → idle → very hot → over heat, no oscillation |
+
+The screen was also toggled repeatedly under load (verified `mWakefulness` flipping between
+`Awake` and `Asleep`); the fan held 88% through every toggle, because stopping the vendor
+removes the vendor's reset path entirely.
+
+One sensor characteristic worth knowing: the CPU thermal-zone reading is **per core**, so when
+the hottest core goes idle its reading can fall 40+°C within 5 s (measured +42.5 °C / −43.6 °C).
+Under a rapidly changing workload the duty therefore tracks a jumping input — the reading is
+bimodal, not the module oscillating. Judge stability from the tier ladder under *steady* load.
+
 ### Fan tiers
 
 Since v1.7.0 there are three temperature sources; the active tier is the highest of all of them:
@@ -438,6 +463,29 @@ setprop ctl.stop pxrfanservice                  # 竞争者没了
 保证**任何时候都有东西在管风扇**。想强制回到旧行为，在 `config.cfg` 里设 `VENDOR_STOP=0`。
 
 `state/cur_duty` 只代表模块最后一次写入的意图，验收要看 `getfaninfo`。
+
+### 极限温度实测表现
+
+作者设备（PICO A8110）8 线程满载、每 5 秒采样一次，126 个采样点、约 11 分钟：
+
+| 项 | 结果 |
+|---|---|
+| duty | 连续 108 个采样点稳在 88%（过热档） |
+| RPM | 13300–13407 |
+| CPU（最热热区） | 峰值 94.6–95.4°C —— **已过 PICO 自己的 90°C 告警线** |
+| 皮肤模型 | 稳态 ~50.3°C |
+| 充电 IC | ~49.7°C |
+| 原厂服务 | 全程 `stopped`，`PxrFanService` 根本没运行过 |
+| 守护 / watchdog PID | 全程不变（15180 / 8705），两个进程一次都没重启 |
+| 硬件 duty vs 模块意图 | 126 个采样点里只有 1 个不一致，且是升档过程中的瞬态 |
+| 档位阶梯 | 单调无抖动：安静 → 空闲 → 很热 → 过热 |
+
+还在满载中反复开关屏（实测 `mWakefulness` 在 Awake/Asleep 之间真的翻转），每次开关屏 duty
+都保持 88% —— 因为停掉原厂后，原厂那条「reset 路径」根本不存在了。
+
+**一个需要知道的传感器特性（不是 bug）**：CPU 热区读数是**逐核**的，最热的核一空闲，读数会在
+5 秒内掉 40+°C（实测 +42.5°C / −43.6°C）。所以负载突变时 duty 会在 0%↔88% 之间跳 —— 那是
+**读数本身在跳**，不是模块在抖。判断稳不稳要看**同样负载下**档位是否单调。
 
 ### 温控档位
 
@@ -782,6 +830,32 @@ setprop ctl.stop pxrfanservice                  # конкурент убран
 `config.cfg`.
 
 `state/cur_duty` хранит только последнее намерение модуля — проверять нужно `getfaninfo`.
+
+### Поведение при длительной максимальной нагрузке
+
+Восемь busy loops на устройстве автора (PICO A8110), замер каждые 5 с, 126 выборок за ~11 минут:
+
+| | Результат |
+|---|---|
+| Duty | стабильно 88% (ступень перегрева) на протяжении 108 выборок подряд |
+| RPM | 13300–13407 |
+| CPU (самая горячая зона) | пик 94.6–95.4°C — **выше собственной линии предупреждения PICO в 90°C** |
+| Модель кожи | установилась на ~50.3°C |
+| ИС зарядки | ~49.7°C |
+| Сервис vendor | `stopped` весь прогон — `PxrFanService` даже не выводил логов |
+| PID демона / watchdog | не менялись (15180 / 8705); ни один процесс не перезапускался |
+| Реальный duty против намерения модуля | расхождение в 1 выборке из 126, только во время повышения |
+| Шкала ступеней | монотонная — тихая → свободная → горячая → перегрев, без колебаний |
+
+Экран также многократно переключался под нагрузкой (проверено: `mWakefulness` реально менялся
+между `Awake` и `Asleep`); вентилятор держал 88% при каждом переключении, потому что остановка
+vendor полностью убирает его путь сброса.
+
+Одна особенность датчика, о которой стоит знать: показание CPU thermal zone — **по ядрам**,
+поэтому когда самое горячее ядро простаивает, его показание может упасть на 40+°C за 5 с
+(измерено +42.5 °C / −43.6 °C). При быстро меняющейся нагрузке duty поэтому следует за
+скачущим входом — скачет показание, а не модуль колеблется. О стабильности судят по шкале
+ступеней при *постоянной* нагрузке.
 
 ### Ступени охлаждения
 
