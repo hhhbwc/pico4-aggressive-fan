@@ -48,14 +48,44 @@ The clamp is bypassed when genuinely hot: skin ≥ 69°C, charger IC ≥ 75°C *
 daemon was actually starting. Caught during device testing of this release. `service.sh` now
 registers its pid before the grace sleep, and restart confirms in about a second.
 
+**5. A single-core spike could jump the whole ladder.**
+
+With max-of-zones the hottest core went from 70 to 82°C inside a second, and every upshift was
+immediate, so the fan stepped 25 → 55 → 78 → 88% within a minute with no change in workload.
+Upshifts now need `UPSHIFT_CONFIRM` consecutive loops above the current tier (default 2, about
+5 s). Downshifts and hysteresis are untouched, the first decision after boot is exempt, and
+`UPSHIFT_CONFIRM=1` restores the old immediate behaviour.
+
+**6. `config.cfg` values were blacklisted, not whitelisted.**
+
+The old filter rejected `$`, backticks, `;` and `&` but not `|`, `>` or `<`. A value such as
+`T0=1|reboot` reached `eval "$KEY=$VALUE"` and ran the right-hand side as a pipeline — root
+command execution from a user-editable file. Values are now whitelisted per key type: digits
+with an optional leading minus for numeric keys, digits and commas for `CPU_ZONES`. Anything
+else drops the line.
+
+**7. A `config.cfg` that was not a regular file hung the daemon.**
+
+`[ -r ]` is true for a directory, and `tr -d '' < dir` spins forever on EISDIR (observed on
+device: two `tr` processes at 100% CPU, `--dumpcfg` never returning). Both scripts now require
+`[ -f ]` before reading the config.
+
+**8. `log()`'s fallback could corrupt a function's return value.**
+
+When `/system/bin/log` was unavailable the fallback echoed to stdout. Functions whose stdout is
+captured (`$(pick_tier)`, `$(get_rpm)`) return that text as their value, so on such a build the
+tier name became `PicoFanTC: ...` and every tier comparison failed silently. The fallback now
+writes to stderr. Found by running the self-test under WSL.
+
 ### Added
 
 - `CPU_ENABLE` (default 1), `CPU_ZONES` (default `1,2,3,4,7,8,9,10,11`), `CPU0..CPU4`
-  (78/81/84/87/90°C), `CPU_HYSTERESIS` (2000 m°C).
+  (78/81/84/87/90°C), `CPU_HYSTERESIS` (2000 m°C), `UPSHIFT_CONFIRM` (2 loops).
 - `CPU_ZONES` is validated: comma-separated integers 0–99, max 24 entries; invalid zones are
   dropped, an empty result falls back to the default list.
 - `service.sh --selftest` adds section [13]: max-of-zones, dead/invalid zone skipping,
-  CPU-driven overheat, CPU hysteresis, `CPU_ENABLE=0`, and the screen-off exemption.
+  CPU-driven overheat, CPU hysteresis, `CPU_ENABLE=0`, and the screen-off exemption; and
+  section [14] for upshift smoothing (confirm, spike reset, no-delay downshift, off switch).
 - Log lines now print all three sources (`skin 65C chg 45C cpu 88C`) instead of skin only.
 - `action.sh status` prints the three temperatures; the tier table shows the CPU thresholds.
 
@@ -70,8 +100,24 @@ registers its pid before the grace sleep, and restart confirms in about a second
   screen asleep at CPU 85°C / skin 58°C the clamp held IDLE 25%, as designed.
 - Awake, with the VR home running: CPU max 79–82°C → IDLE 25%. A per-second sample showed
   cluster 0 at 67–70°C and `cpu-1-3-usr` (zone 10) spiking to 82°C, so the maximum is usually
-  one hot core. The tier can step up/down around a threshold while that core spikes; that is
-  the requested max-of-sources behaviour, not a smoothing bug.
+  one hot core — this is what made the tier flap before upshift smoothing was added.
+
+### Robustness matrix (2026-11-02)
+
+A harness in `/data/local/tmp` (fake MCU tool, fake sensors, fake `getprop`/`setprop`/`dumpsys`,
+own state directory) ran 95 checks, all passing:
+
+- Config fuzz: empty, garbage, injection payloads, extreme values, non-monotonic thresholds,
+  malformed/40-entry/leading-zero `CPU_ZONES`, CRLF, inline comments, duplicate keys, and
+  `config.cfg` replaced by a directory.
+- Sensor fuzz: missing, empty, `-22`, non-numeric, and absurd (999999) values on skin, charger
+  and CPU zones; the module falls back to the remaining sources or reports no data, never crashes.
+- Tool lifecycle: always-failing tool (gives up and hands back after `MAX_FAIL_STREAK`),
+  hanging tool (watchdog kills it, the loop survives), garbage output, a second instance
+  (refused), and a stale pid file (replaced).
+- Live fault injection on the real module: `setfantestmode 0` under 8-core load (vendor took
+  the fan at duty 50%, module re-asserted, failed, rebuilt test mode and restored 88% in 32 s);
+  `kill -9` of the daemon followed by `action.sh restart` recovered immediately.
 
 ### Compatibility
 

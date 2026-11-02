@@ -119,7 +119,7 @@ About 3450 RPM is the slowest the fan will actually turn, so any duty under ~15%
 
 **The overheat tier no longer hands back to the vendor (v1.6.0 default).** Stock steady state is only duty 40% / ~7790 RPM, so handing control to a weaker policy as things get hotter is counterproductive. At ≥69°C skin, ≥79°C charger IC or ≥90°C CPU the module now holds 88% itself. To restore the old behaviour set `OVERHEAT_HANDBACK=1`; control is then retaken only once the active tier (the highest of all three sources) falls back to `OVERHEAT_RELEASE_RANK` (default 3 = hot).
 
-**Hysteresis**: tiers move up the moment a threshold is crossed, but move down only once the source has fallen below `threshold − HYSTERESIS`. (In v1.2.0 this was documented but not actually implemented outside the quiet tier — the parameter had no effect.)
+**Hysteresis & upshift smoothing**: downshifts need the source below `threshold − HYSTERESIS`. (In v1.2.0 this was documented but not actually implemented outside the quiet tier — the parameter had no effect.) Since v1.7.0 an upshift must persist for `UPSHIFT_CONFIRM` loops (default 2, about 5 s) before it is accepted, which filters the single-core spikes that max-of-zones exposes; `UPSHIFT_CONFIRM=1` restores immediate upshifts. Downshifts are never delayed by this.
 
 **RPM cap, temperature-gated**: if the MCU reports rpm ≥ `RPM_CAP` (default 12000) **and** the temperature tier is at least `RPM_RELEASE_RANK` (default 3 = hot, i.e. skin ≥ 65°C, charger IC ≥ 70°C or CPU ≥ 84°C), the next loop raises duty to `RPM_DUTY` (default 88%).
 
@@ -167,6 +167,7 @@ CPU2=84000
 CPU3=87000
 CPU4=90000
 CPU_HYSTERESIS=2000
+UPSHIFT_CONFIRM=2
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -238,9 +239,10 @@ Beyond the tier table, `config.cfg` carries these knobs:
 | `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0.** Tier ceiling while not `Awake` (`0` quiet, `1` idle … `5` overheat). `-1` disables the clamp. Genuine heat (charger IC ≥ 75°C, skin ≥ 69°C or CPU ≥ 87°C) bypasses it. |
 | `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0.** Refresh `mWakefulness` every N loops (× `LOOP_INTERVAL`). |
 | `CPU_ENABLE` | 1 | **v1.7.0.** `0` turns the CPU/SoC source off and restores the v1.6 two-source behaviour. |
-| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0.** Comma-separated thermal zone numbers; the module uses the hottest readable one. Defaults are the zones PICO's warning manager watches. Invalid/missing zones are skipped; adding 25 includes the GPU (`gpuss-max-step`). |
+| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0.** Comma-separated thermal zone numbers; the module uses the hottest readable one. Defaults are the zones PICO's warning manager watches. The value may contain only digits and commas — anything else makes the module ignore the whole key and use the default list. Zones that are valid but unreadable are skipped at read time; adding 25 includes the GPU (`gpuss-max-step`). |
 | `CPU0..CPU4` | 78000/81000/84000/87000/90000 | **v1.7.0.** CPU/SoC tier thresholds in millidegrees C; must be strictly increasing. |
 | `CPU_HYSTERESIS` | 2000 | **v1.7.0.** Downshift hysteresis for the CPU source (2°C). |
+| `UPSHIFT_CONFIRM` | 2 | **v1.7.0.** Consecutive loops a higher tier must persist before it is accepted (1 = no smoothing). Only affects upshifts. |
 
 The overheat tier is controlled by `OVERHEAT_HANDBACK`: with the default `0` the module holds `TIER_OVERHEAT=88%` itself; set it to `1` to restore the handback to stock. Stock steady state is only duty 40% / ~7790 RPM, so handback usually means *less* cooling — only enable it if you trust the vendor's protection logic more. To change the ceiling, edit `TIER_OVERHEAT` directly (the module accepts 0–100, but 88% is usually the measured peak).
 
@@ -266,7 +268,7 @@ effect:
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 ```
 
-v1.6.0 also fixed a **silent failure**: the old parser did not strip trailing comments, so `KEY=25   # note` was rejected as non-numeric and fell back to the default (14 keys were reset in one observed run). Comments are now stripped before validation. `CHG0..CHG4` and `CPU0..CPU4` must be strictly increasing; `CPU_ZONES` keeps only integer zone numbers in 0–99 (max 24, falling back to the default list if nothing valid is left), and `SCREEN_OFF_MAX_RANK` is clamped to `-1..5`.
+v1.6.0 also fixed a **silent failure**: the old parser did not strip trailing comments, so `KEY=25   # note` was rejected as non-numeric and fell back to the default (14 keys were reset in one observed run). Comments are now stripped before validation. `CHG0..CHG4` and `CPU0..CPU4` must be strictly increasing; `CPU_ZONES` accepts only digits and commas (any other character discards the whole value); valid entries are capped at 24 and must be 0–99, and `SCREEN_OFF_MAX_RANK` is clamped to `-1..5`.
 
 ### Self-test
 
@@ -274,7 +276,7 @@ v1.6.0 also fixed a **silent failure**: the old parser did not strip trailing co
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-Runs the tier ladder, hysteresis, the three-source merge (including max-of-zones and skipping dead CPU zones), the screen-off clamp and the RPM gate as pure logic against a scratch state directory. It does not touch the fan or the real sensor node, so it is safe to run any time. Use it to see exactly what a given `config.cfg` will do before you rely on it. `action.sh selftest` is a shorthand for the same thing.
+Runs the tier ladder, hysteresis, the three-source merge (including max-of-zones and skipping dead CPU zones), upshift smoothing, the screen-off clamp and the RPM gate as pure logic against a scratch state directory. It does not touch the fan or the real sensor node, so it is safe to run any time. Use it to see exactly what a given `config.cfg` will do before you rely on it. `action.sh selftest` is a shorthand for the same thing.
 
 The self-test must run on the device (or in WSL): Git Bash has no `/data`, so `mkdir /data/local/tmp/...` fails and the script exits silently, looking like it hung.
 
@@ -421,7 +423,7 @@ PICO A8110 实测 duty → RPM 曲线：
 
 **过热档不再交回原厂（v1.6.0 默认）**：原厂稳态只有 duty 40% / ~7790 RPM，越热越交给一个更不制风的策略是反效果。所以皮肤 ≥69°C、充电 IC ≥79°C 或 CPU ≥90°C 时本模块自己吃 88%。想恢复旧行为把 `OVERHEAT_HANDBACK` 设为 `1`，交回后要等实际档位（三路取最高）落回 `OVERHEAT_RELEASE_RANK`（默认 3 = 较热）才重新接管。
 
-**滞回**：档位向上跨阈值直接升档，向下则需要跌破 `阈值 − HYSTERESIS` 才降档（v1.2.0 里这段描述只写在文档里，代码除安静档外根本没实现，这个参数实际上不起作用）。
+**滞回与升档平滑**：降档需要跌破 `阈值 − HYSTERESIS`（v1.2.0 里这段描述只写在文档里，代码除安静档外根本没实现，这个参数实际上不起作用）。v1.7.0 起升档要连续 `UPSHIFT_CONFIRM` 个循环（默认 2，约 5 秒）都高于当前档位才接受，用来过滤多源取最大后暴露出来的单核尖峰；设成 `1` 恢复立即升档。降档不受这个延迟影响。
 
 **RPM 上限（带温度闸门）**：若 MCU 上报 rpm ≥ `RPM_CAP`（默认 12000）**且**当前温度档位不低于 `RPM_RELEASE_RANK`（默认 3 = 较热，即皮肤 ≥ 65°C、充电 IC ≥ 70°C 或 CPU ≥ 84°C），下一循环才把 duty 提到 `RPM_DUTY`（默认 88%）。
 
@@ -469,6 +471,7 @@ CPU2=84000
 CPU3=87000
 CPU4=90000
 CPU_HYSTERESIS=2000
+UPSHIFT_CONFIRM=2
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -540,9 +543,10 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 | `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0。** 非 Awake 时的档位上限（0=安静 1=空闲 … 5=过热）。`-1` 关闭熄屏压档。真烫时（充电 IC ≥ 75°C、皮肤 ≥ 69°C 或 CPU ≥ 87°C）豁免。 |
 | `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0。** 每 N 个循环（× `LOOP_INTERVAL`）刷新一次 `mWakefulness`。 |
 | `CPU_ENABLE` | 1 | **v1.7.0。** 设为 `0` 关闭 CPU/SoC 这一路，退回 v1.6 的双源行为。 |
-| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0。** 逗号分隔的热区编号，模块取其中可读热区的最大值。默认就是 PICO 告警管理器监控的那批；坏节点自动跳过；把 25 加进来就包含 GPU（`gpuss-max-step`）。 |
+| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0。** 逗号分隔的热区编号，模块取其中可读热区的最大值。默认就是 PICO 告警管理器监控的那批；值里只能有数字和逗号，出现其它字符会让整个键被忽略、改用默认列表；合法但读不到的 zone 在读取时跳过。把 25 加进来就包含 GPU（`gpuss-max-step`）。 |
 | `CPU0..CPU4` | 78000/81000/84000/87000/90000 | **v1.7.0。** CPU/SoC 这一路的档位阈值（毫摄氏度），必须严格递增。 |
 | `CPU_HYSTERESIS` | 2000 | **v1.7.0。** CPU 这一路的降档回滞（2°C）。 |
+| `UPSHIFT_CONFIRM` | 2 | **v1.7.0。** 升档需要连续多少个循环高于当前档位才接受（1 = 关闭平滑）。只作用于上冲。 |
 
 过热档的处置由 `OVERHEAT_HANDBACK` 决定：默认 `0` 时模块自己吃 `TIER_OVERHEAT=88%`；设为 `1` 才恢复「交还原厂」。原厂稳态只有 duty 40% / ~7790 RPM，交回通常等于降速，只有更信任原厂保护逻辑时才建议打开。想改顶格转速直接改 `TIER_OVERHEAT`（模块支持 0–100，但 88% 通常是实测最高点）。
 
@@ -562,7 +566,7 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 ```
 
-v1.6.0 还修了一个**静默失效**：旧解析器不剥行尾注释，`KEY=25   # 说明` 会被整行判非法并回落默认值（实测一次刷出 14 条「非法，回落到」）。现在会先剥注释再校验。另外 `CHG0..CHG4` 和 `CPU0..CPU4` 必须严格递增；`CPU_ZONES` 只保留 0–99 的整数编号（最多 24 个，全部非法则回落默认列表）；`SCREEN_OFF_MAX_RANK` 会被夹紧到 `-1..5`。
+v1.6.0 还修了一个**静默失效**：旧解析器不剥行尾注释，`KEY=25   # 说明` 会被整行判非法并回落默认值（实测一次刷出 14 条「非法，回落到」）。现在会先剥注释再校验。另外 `CHG0..CHG4` 和 `CPU0..CPU4` 必须严格递增；`CPU_ZONES` 只接受数字和逗号（出现其它字符整个值被丢弃）；合法项最多 24 个、范围 0–99；`SCREEN_OFF_MAX_RANK` 会被夹紧到 `-1..5`。
 
 ### 自检
 
@@ -570,7 +574,7 @@ v1.6.0 还修了一个**静默失效**：旧解析器不剥行尾注释，`KEY=2
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-把档位阶梯、滞回、三温度源合流（含 CPU 热区取最大、坏节点跳过）、熄屏压档和 RPM 闸门当作纯逻辑在临时状态目录里跑一遍。不碰风扇、不碰真实温度节点，任何时候都能跑。想确认某份 `config.cfg` 到底会怎么动作，先跑它。`action.sh selftest` 是同一个东西的简写。
+把档位阶梯、滞回、三温度源合流（含 CPU 热区取最大、坏节点跳过）、升档平滑、熄屏压档和 RPM 闸门当作纯逻辑在临时状态目录里跑一遍。不碰风扇、不碰真实温度节点，任何时候都能跑。想确认某份 `config.cfg` 到底会怎么动作，先跑它。`action.sh selftest` 是同一个东西的简写。
 
 自检必须在设备上（或 WSL）跑：Git Bash 没有 `/data`，`mkdir /data/local/tmp/...` 会失败并静默退出，看起来像脚本挂了。
 
@@ -717,7 +721,7 @@ Duty, записанный через `setfantestspeed`, не затрагива
 
 **Ступень перегрева больше не отдаётся vendor по умолчанию (v1.6.0).** Заводской установившийся режим — всего duty 40% / ~7790 RPM, поэтому отдавать управление более слабой политике при нагреве — обратный эффект. При коже ≥69°C, ИС зарядки ≥79°C или CPU ≥90°C модуль сам держит 88%. Чтобы вернуть старое поведение, установите `OVERHEAT_HANDBACK=1`; управление вернётся только после того, как активная ступень (максимум из трёх источников) опустится до `OVERHEAT_RELEASE_RANK` (по умолчанию 3 = горячий).
 
-**Гистерезис**: ступень растёт сразу при переходе порога, а падает только после падения ниже `порог − HYSTERESIS`. (В v1.2.0 это было описано в документации, но в коде, кроме тихой ступени, не реализовано — параметр ни на что не влиял.)
+**Гистерезис и сглаживание подъёма**: понижение требует падения ниже `порог − HYSTERESIS` (в v1.2.0 это было описано, но в коде, кроме тихой ступени, не реализовано — параметр ни на что не влиял). С v1.7.0 повышение принимается только после того, как оно продержится `UPSHIFT_CONFIRM` циклов (по умолчанию 2, около 5 с) — это отфильтровывает одиночные пики ядер, которые видны при выборе максимума. `UPSHIFT_CONFIRM=1` возвращает мгновенный подъём; на понижение задержка не распространяется.
 
 **Ограничение по RPM, с температурным шлюзом**: если MCU сообщает rpm ≥ `RPM_CAP` (по умолчанию 12000) **и** текущая температурная ступень не ниже `RPM_RELEASE_RANK` (по умолчанию 3 = горячий, т.е. кожа ≥ 65°C, ИС зарядки ≥ 70°C или CPU ≥ 84°C), на следующем цикле duty поднимается до `RPM_DUTY` (по умолчанию 88%).
 
@@ -765,6 +769,7 @@ CPU2=84000
 CPU3=87000
 CPU4=90000
 CPU_HYSTERESIS=2000
+UPSHIFT_CONFIRM=2
 HYSTERESIS=800
 LOOP_INTERVAL=5
 STARTUP_GRACE=45
@@ -836,9 +841,10 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 | `SCREEN_OFF_MAX_RANK` | 1 | **v1.6.0.** Потолок ступени, когда устройство не `Awake` (`0` тихий, `1` свободный … `5` перегрев). `-1` отключает ограничение. Реальный перегрев (ИС зарядки ≥ 75°C, кожа ≥ 69°C или CPU ≥ 87°C) его обходит. |
 | `WAKE_DUMP_INTERVAL` | 6 | **v1.6.0.** Обновлять `mWakefulness` каждые N циклов (× `LOOP_INTERVAL`). |
 | `CPU_ENABLE` | 1 | **v1.7.0.** `0` отключает источник CPU/SoC и возвращает поведение v1.6 с двумя источниками. |
-| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0.** Номера тепловых зон через запятую; модуль берёт самую горячую из доступных. По умолчанию — зоны, которые отслеживает менеджер предупреждений PICO. Недоступные зоны пропускаются; добавьте 25, чтобы учесть GPU (`gpuss-max-step`). |
+| `CPU_ZONES` | 1,2,3,4,7,8,9,10,11 | **v1.7.0.** Номера тепловых зон через запятую; модуль берёт самую горячую из доступных. По умолчанию — зоны, которые отслеживает менеджер предупреждений PICO. В значении допустимы только цифры и запятые — иначе ключ игнорируется целиком и берётся список по умолчанию. Валидные, но недоступные зоны пропускаются при чтении; добавьте 25, чтобы учесть GPU (`gpuss-max-step`). |
 | `CPU0..CPU4` | 78000/81000/84000/87000/90000 | **v1.7.0.** Пороги ступеней CPU/SoC в миллиградусах; должны строго возрастать. |
 | `CPU_HYSTERESIS` | 2000 | **v1.7.0.** Гистерезис понижения для источника CPU (2°C). |
+| `UPSHIFT_CONFIRM` | 2 | **v1.7.0.** Сколько циклов подряд повышенная ступень должна держаться (1 = без сглаживания). Влияет только на повышение. |
 
 Поведением ступени перегрева управляет `OVERHEAT_HANDBACK`: при значении по умолчанию `0` модуль сам держит `TIER_OVERHEAT=88%`; при `1` возвращается передача заводской политике. Заводской установившийся режим — всего duty 40% / ~7790 RPM, поэтому передача обычно означает *меньше* охлаждения; включайте её, только если больше доверяете заводской термозащите. Чтобы изменить потолок, правьте `TIER_OVERHEAT` напрямую (модуль принимает 0–100, но 88% обычно является измеренным максимумом).
 
@@ -854,7 +860,7 @@ su -c '/system/bin/gd32ipdclient_test getfaninfo'
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 ```
 
-В v1.6.0 также исправлен **тихий отказ**: старый парсер не отбрасывал комментарий в конце строки, поэтому `KEY=25   # пояснение` считался нечисловым и молча откатывался к значению по умолчанию (в одном прогоне сбросились 14 ключей). Теперь комментарий срезается до проверки. Кроме того, `CHG0..CHG4` и `CPU0..CPU4` должны строго возрастать; `CPU_ZONES` сохраняет только целые номера зон 0–99 (не более 24, при полном отсутствии валидных — список по умолчанию); `SCREEN_OFF_MAX_RANK` ограничивается диапазоном `-1..5`.
+В v1.6.0 также исправлен **тихий отказ**: старый парсер не отбрасывал комментарий в конце строки, поэтому `KEY=25   # пояснение` считался нечисловым и молча откатывался к значению по умолчанию (в одном прогоне сбросились 14 ключей). Теперь комментарий срезается до проверки. Кроме того, `CHG0..CHG4` и `CPU0..CPU4` должны строго возрастать; `CPU_ZONES` принимает только цифры и запятые (любой другой символ отбрасывает всё значение); допустимых номеров не более 24, диапазон 0–99; `SCREEN_OFF_MAX_RANK` ограничивается диапазоном `-1..5`.
 
 ### Самотест
 
@@ -862,7 +868,7 @@ su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --dumpcfg"
 su -c "sh /data/adb/modules/pico4_fan_tempcontrol/service.sh --selftest"
 ```
 
-Прогоняет лестницу ступеней, гистерезис, слияние трёх источников (включая максимум по зонам CPU и пропуск мёртвых зон), ограничение при выключенном экране и RPM-шлюз как чистую логику во временном каталоге состояния. Вентилятора и реального узла температуры не касается, поэтому запускать можно в любой момент. Удобно, чтобы заранее увидеть, как поведёт себя конкретный `config.cfg`. `action.sh selftest` — то же самое.
+Прогоняет лестницу ступеней, гистерезис, слияние трёх источников (включая максимум по зонам CPU и пропуск мёртвых зон), сглаживание подъёма, ограничение при выключенном экране и RPM-шлюз как чистую логику во временном каталоге состояния. Вентилятора и реального узла температуры не касается, поэтому запускать можно в любой момент. Удобно, чтобы заранее увидеть, как поведёт себя конкретный `config.cfg`. `action.sh selftest` — то же самое.
 
 Самотест нужно запускать на устройстве (или в WSL): в Git Bash нет `/data`, поэтому `mkdir /data/local/tmp/...` завершается ошибкой, и скрипт молча выходит — выглядит как зависание.
 

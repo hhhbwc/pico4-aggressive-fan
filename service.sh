@@ -81,6 +81,10 @@
 #     默认 78/81/84/87/90C，即 84C 给 65%、87C 给 78%、90C 给 88%，赶在厂商
 #     告警线之前把转速拉起来。CPU_ENABLE=0 可退回 v1.6 的两源行为。
 #
+# [14] 升档平滑。多源取最大后，单核 1-2 秒的尖峰会把档位直接顶上去（实测
+#     cpu-1-3-usr 在 70-82C 间跳）。要求连续 UPSHIFT_CONFIRM 个循环（默认 2，
+#     约 5 秒）都高于当前档位才升档，降档与回滞不变。UPSHIFT_CONFIRM=1 关闭。
+#
 # 其它：state/last_run.log 死变量清掉。
 #
 # 用法补充
@@ -109,6 +113,7 @@ IN_TEST="$STATE_DIR/in_test"
 LAST_OK="$STATE_DIR/last_ok"
 GAVE_UP="$STATE_DIR/gave_up"
 PID_FILE="$STATE_DIR/service.pid"
+UPSHIFT_PENDING="$STATE_DIR/upshift_pending"
 
 TOOL="/system/bin/gd32ipdclient_test"
 
@@ -148,7 +153,7 @@ CHG_HYSTERESIS=1500
 # 默认就是 PICO ChipsetWarnManager 监控的那批 usr 热区：cpu-0-0..3 (zone 1-4)
 # 与 cpu-1-0..3 (zone 7-10)，再加它同样纳入告警的 zone 11。zone86 是虚拟
 # 皮肤模型，滞后于核心温度，只看它会让风扇在 CPU 已经 90C 时还停在 55%。
-# CPU_ZONES 用逗号分隔的 zone 编号；节点读不到/返回负值时自动跳过该区。
+# CPU_ZONES 只接受数字和逗号（其它字符整键忽略）；合法但读不到的区在读取时跳过。
 THERMAL_DIR="${PICO4_THERMAL_DIR:-/sys/class/thermal}"
 CPU_ENABLE=1
 CPU_ZONES="1,2,3,4,7,8,9,10,11"
@@ -158,6 +163,12 @@ CPU2=84000   # -> hot        (84C)
 CPU3=87000   # -> very hot   (87C)
 CPU4=90000   # -> overheat   (90C，厂商 ChipsetWarnManager 的告警线)
 CPU_HYSTERESIS=2000
+
+# 修 [14]：升档平滑（只作用于上冲）。CPU 热区取最大值后，单核尖峰会让档位在
+# 1-2 秒内跳好几档（实测 cpu-1-3-usr 从 70C 尖峰到 82C）。这里要求连续
+# UPSHIFT_CONFIRM 个循环都高于当前档位才升档，默认 2 = 多等一个循环（5 秒）；
+# 1 关闭平滑，恢复"跨阈值立刻升"。降档与回滞不受影响。
+UPSHIFT_CONFIRM=2
 
 # Thresholds, in millidegrees C.
 # v1.6 按本机实测重标定（2026-10-31，PICO A8110 + 眼追面捕套件）：这台机器只要
@@ -218,9 +229,11 @@ WAKE_CACHE=""
 # (2) 值里的 $(...) 或反引号会在 source 时被执行（root 下即任意代码执行）。
 # 所以这里逐行解析：先去 CR，只接受已知数值键，拒绝一切非白名单键与含命令
 # 替换的值。实测注入 TOOL=/system/bin/false 或 PWNED=$(touch ...) 都被忽略。
-CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS"
+CONFIG_KEYS="TIER_QUIET TIER_IDLE TIER_WARM TIER_HOT TIER_VERYHOT T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK TIER_OVERHEAT OVERHEAT_HANDBACK CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS UPSHIFT_CONFIRM"
 
-if [ -r "$CONFIG_FILE" ]; then
+# 必须是普通文件：-r 对目录/FIFO 也成立，而 read 读目录在 mksh 里不返回，
+# 模块会卡死在启动阶段（实测：config.cfg 被误建成目录 -> --dumpcfg 永久挂起）。
+if [ -f "$CONFIG_FILE" ] && [ -r "$CONFIG_FILE" ]; then
     CFG_NORM="$STATE_DIR/config.norm"
     if command -v tr >/dev/null 2>&1 \
        && tr -d '\r' < "$CONFIG_FILE" > "$CFG_NORM" 2>/dev/null; then
@@ -236,8 +249,19 @@ if [ -r "$CONFIG_FILE" ]; then
         # 用户改的参数根本不生效（v1.5.0 的实测缺陷：14 个键全部回落到默认）。
         _v=$(printf '%s' "$_v" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//' 2>/dev/null)
         [ -n "$_v" ] || continue
-        # 拒绝含命令替换/语句分隔的 VALUE（防 PWNED=$(reboot) 之类注入）
-        case "$_v" in *=*|*'$'*|*'\`'*|*';'*|*'&'*) continue ;; esac
+        # 白名单校验 VALUE，而不是列举危险字符。黑名单漏掉 '|' '>' '<' 时
+        # `T0=1|reboot` 会在下面的 eval 里真的执行一条管道命令（root RCE）。
+        # 所有数值键只允许十进制（可带前置负号），CPU_ZONES 只允许数字和逗号。
+        case "$_k" in
+            CPU_ZONES)
+                case "$_v" in *[!0-9,]*) continue ;; esac
+                ;;
+            *)
+                case "$_v" in *[!0-9-]*) continue ;; esac
+                case "$_v" in -) continue ;; esac
+                case "${_v#-}" in *-*) continue ;; esac
+                ;;
+        esac
         _ok=0
         for _w in $CONFIG_KEYS; do
             [ "$_k" = "$_w" ] && _ok=1 && break
@@ -352,6 +376,9 @@ sanitize_config() {
     for _cz in $_cl; do
         [ "$_cn" -ge 24 ] && break
         case "$_cz" in ''|*[!0-9]*) continue ;; esac
+        # 007 归一化成 7，否则会拼出不存在的 thermal_zone007。
+        _cz=$(printf '%s' "$_cz" | sed 's/^0*//')
+        [ -n "$_cz" ] || _cz=0
         [ "$_cz" -le 99 ] 2>/dev/null || continue
         _cout="${_cout:+$_cout,}$_cz"
         _cn=$((_cn + 1))
@@ -379,11 +406,14 @@ sanitize_config() {
     _g=$((CPU4 - CPU3)); [ "$_g" -lt "$_gap" ] && _gap=$_g
     _gap=$((_gap - 1)); [ "$_gap" -ge 0 ] || _gap=0
     clamp_int CPU_HYSTERESIS "$CPU_HYSTERESIS" 0 "$_gap" 2000
+    clamp_int UPSHIFT_CONFIRM "$UPSHIFT_CONFIRM" 1 10 2
 }
 
 log() {
     # 用绝对路径：函数名叫 log 会遮蔽同名二进制，裸写 log 会无限递归刷爆 logd。
-    /system/bin/log -t "$LOG_TAG" "$*" 2>/dev/null || echo "$LOG_TAG: $*"
+    # 兜底必须写 stderr：pick_tier/log 等函数的 stdout 会被 $( ) 捕获当返回值用，
+    # 混进一行日志就会让档位名变成 "PicoFanTC: ...\nIDLE"，档位匹配全部失效。
+    /system/bin/log -t "$LOG_TAG" "$*" 2>/dev/null || echo "$LOG_TAG: $*" >&2
 }
 
 # 配置加载完立刻校验一次，之后所有逻辑拿到的都是合法值。
@@ -646,14 +676,34 @@ pick_tier() {
     [ "$rank_p" -gt "$rank" ] && rank=$rank_p
 
     prev=$(cat "$CUR_TIER" 2>/dev/null)
+    no_prev=0
     case "$prev" in
         QUIET|IDLE|WARM|HOT|VERYHOT|OVERHEAT) ;;
-        *) prev=IDLE ;;   # unknown / first run: behave like IDLE
+        *) prev=IDLE; no_prev=1 ;;   # unknown / first run: behave like IDLE
     esac
     prev_rank=$(tier_rank "$prev")
 
+    # 修 [14]：升档平滑，只作用于上冲。要求连续 UPSHIFT_CONFIRM 个循环都高于
+    # 当前档位才接受，避免单核尖峰（实测 cpu-1-3-usr 在 1-2 秒内 70C -> 82C）
+    # 把风扇直接顶到 78%。首次启动没有历史档位，不做平滑。降档与回滞不变。
+    if [ "$no_prev" = "0" ] && [ "$rank" -gt "$prev_rank" ] && [ "$UPSHIFT_CONFIRM" -gt 1 ]; then
+        _pend=$(cat "$UPSHIFT_PENDING" 2>/dev/null)
+        _pc=${_pend#*:}
+        case "$_pc" in ''|*[!0-9]*) _pc=0 ;; esac
+        _pc=$((_pc + 1))
+        if [ "$_pc" -lt "$UPSHIFT_CONFIRM" ]; then
+            echo "$rank:$_pc" > "$UPSHIFT_PENDING"
+            [ "$_pc" -eq 1 ] && log "upshift to rank $rank pending ($_pc/$UPSHIFT_CONFIRM)"
+            rank=$prev_rank
+        else
+            rm -f "$UPSHIFT_PENDING" 2>/dev/null
+        fi
+    else
+        rm -f "$UPSHIFT_PENDING" 2>/dev/null
+    fi
+
     if [ "$rank" -ge "$prev_rank" ]; then
-        # 升档：纯阈值，跨过就上（快速响应升温，安全优先）。
+        # 升档（已确认或 UPSHIFT_CONFIRM=1）：跨过阈值就上。
         new_rank=$rank
     else
         new_rank=$prev_rank
@@ -819,6 +869,8 @@ main() {
 
     # 上一次运行如果因写入持续失败而放弃过，新一轮重新尝试。
     rm -f "$GAVE_UP" 2>/dev/null
+    # 升档确认计数只对连续循环有意义，重启后从零开始。
+    rm -f "$UPSHIFT_PENDING" 2>/dev/null
 
     # 修 [5]：用户显式关过 -> 不接管，等 action.sh enable 撤销。
     if [ -f "$DISABLED" ]; then
@@ -1015,6 +1067,9 @@ selftest() {
     # 状态，当时设备在睡 -> 除皮肤达到 T4 外全部被压）。
     printf '%s' "Awake" > "$WF"
     WAKE_CACHE=""
+    # 阶梯/合流用例都按"跨阈值立即升档"验证；平滑单独在 [14] 里测。
+    UPSHIFT_CONFIRM=1
+    rm -f "$UPSHIFT_PENDING" 2>/dev/null
 
     echo "== [3] 阶梯 + 真实回滞 (T0=$T0 T1=$T1 T2=$T2 T3=$T3 T4=$T4 H=$HYSTERESIS) =="
     echo "prev=IDLE，按温度升序："
@@ -1052,6 +1107,7 @@ selftest() {
     echo "  档位 duty: QUIET=$TIER_QUIET IDLE=$TIER_IDLE WARM=$TIER_WARM HOT=$TIER_HOT VERYHOT=$TIER_VERYHOT OVERHEAT=$TIER_OVERHEAT (HANDBACK=$OVERHEAT_HANDBACK)"
     echo "  充电IC阈值: $CHG0/$CHG1/$CHG2/$CHG3/$CHG4 回滞=$CHG_HYSTERESIS"
     echo "  CPU阈值: $CPU0/$CPU1/$CPU2/$CPU3/$CPU4 回滞=$CPU_HYSTERESIS 启用=$CPU_ENABLE zones=$CPU_ZONES"
+    echo "  升档平滑: UPSHIFT_CONFIRM=$UPSHIFT_CONFIRM（1=关闭，只影响上冲）"
     echo "  熄屏压档: SCREEN_OFF_MAX_RANK=$SCREEN_OFF_MAX_RANK 刷新间隔=$WAKE_DUMP_INTERVAL 圈"
     echo "  非法值会被夹紧/回落并记日志，用 --dumpcfg 看最终生效值。"
 
@@ -1151,6 +1207,38 @@ selftest() {
     CPU_ENABLE=1
     for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
     echo ""
+    echo "== [14] 升档平滑（用例内 UPSHIFT_CONFIRM=2，只作用于上冲）=="
+    UPSHIFT_CONFIRM=2
+    rm -f "$UPSHIFT_PENDING" 2>/dev/null
+    for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
+    printf '58000' > "$ST"; printf '450' > "$CG"
+    printf '89000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "IDLE" > "$CT"
+    echo "  第1个循环 CPU 89C -> $(pick_tier)（应 IDLE，挂起 1/2）"
+    echo "  第2个循环 CPU 89C -> $(pick_tier)（应 VERYHOT，确认）"
+    echo "  尖峰只持续一个循环时必须作废："
+    echo "IDLE" > "$CT"; rm -f "$UPSHIFT_PENDING"
+    echo "    尖峰第1次 -> $(pick_tier)（应 IDLE）"
+    printf '70000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "    回落       -> $(pick_tier)（应 IDLE，计数清零）"
+    printf '89000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "    再尖峰第1次 -> $(pick_tier)（应 IDLE，重新计数）"
+    echo "    再尖峰第2次 -> $(pick_tier)（应 VERYHOT）"
+    echo "  降档不受平滑影响："
+    echo "VERYHOT" > "$CT"; rm -f "$UPSHIFT_PENDING"
+    printf '50000' > "$ST"; printf '450' > "$CG"
+    printf '70000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "    VERYHOT + 全凉 -> $(pick_tier)（应 QUIET，一次到位）"
+    echo "  关闭平滑（UPSHIFT_CONFIRM=1）："
+    UPSHIFT_CONFIRM=1; echo "IDLE" > "$CT"; rm -f "$UPSHIFT_PENDING"
+    printf '58000' > "$ST"
+    printf '89000' > "$THERMAL_DIR/thermal_zone1/temp"
+    echo "    第1个循环 -> $(pick_tier)（应 VERYHOT，立即）"
+    UPSHIFT_CONFIRM=2
+    # 自检收尾：把工况恢复成 [11]/[1] 假设的中性状态。
+    for _z in $CPU_ZONE_LIST; do printf '70000' > "$THERMAL_DIR/thermal_zone$_z/temp"; done
+    printf '58000' > "$ST"; printf '450' > "$CG"
+    echo ""
     echo "== [11] 漂移校验：写入被拒即判定丢锁并重接管（只读，不在此处触发）=="
     echo "  实测：注入丢锁后 1 秒内 drift -> re-arm -> duty 恢复，见 logcat -s PicoFanTC"
     echo ""
@@ -1170,6 +1258,7 @@ dumpcfg() {
               T0 T1 T2 T3 T4 HYSTERESIS LOOP_INTERVAL STARTUP_GRACE \
               CHG0 CHG1 CHG2 CHG3 CHG4 CHG_HYSTERESIS \
               CPU_ENABLE CPU_ZONES CPU0 CPU1 CPU2 CPU3 CPU4 CPU_HYSTERESIS \
+              UPSHIFT_CONFIRM \
               SCREEN_OFF_MAX_RANK WAKE_DUMP_INTERVAL \
               RPM_CAP RPM_DUTY RPM_RELEASE_RANK OVERHEAT_RELEASE_RANK \
               RETRY_BACKOFF FAIL_LOG_EVERY MAX_FAIL_STREAK; do

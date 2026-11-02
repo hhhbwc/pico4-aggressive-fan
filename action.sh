@@ -50,6 +50,7 @@ HYSTERESIS=800
 CHG0=60000; CHG1=65000; CHG2=70000; CHG3=75000; CHG4=79000; CHG_HYSTERESIS=1500
 CPU_ENABLE=1; CPU_ZONES="1,2,3,4,7,8,9,10,11"
 CPU0=78000; CPU1=81000; CPU2=84000; CPU3=87000; CPU4=90000; CPU_HYSTERESIS=2000
+UPSHIFT_CONFIRM=2
 SCREEN_OFF_MAX_RANK=1; WAKE_DUMP_INTERVAL=6
 RPM_CAP=12000; RPM_DUTY=88; RPM_RELEASE_RANK=3
 OVERHEAT_RELEASE_RANK=3
@@ -61,7 +62,7 @@ MAX_FAIL_STREAK=10
 if [ -r "$SVC" ] && sh "$SVC" --dumpcfg > "$STATE_DIR/config.effective" 2>/dev/null; then
     . "$STATE_DIR/config.effective" 2>/dev/null
     rm -f "$STATE_DIR/config.effective" 2>/dev/null
-elif [ -r "$CONFIG_FILE" ]; then
+elif [ -f "$CONFIG_FILE" ] && [ -r "$CONFIG_FILE" ]; then
     # 与 service.sh 一致：先去掉 CR，避免 CRLF 配置里的回车跑进状态表和 duty 值。
     CFG_NORM="$STATE_DIR/config.norm"
     if command -v tr >/dev/null 2>&1 \
@@ -251,6 +252,7 @@ tier_table() {
         "${CPU_ZONES:-1,2,3,4,7,8,9,10,11}" \
         "${CPU0:-78000}" "${CPU1:-81000}" "${CPU2:-84000}" "${CPU3:-87000}" "${CPU4:-90000}" \
         "${CPU_HYSTERESIS:-2000}" "${CPU_ENABLE:-1}"
+    printf "  升档平滑: 连续 %s 个循环确认（1=关闭，只影响上冲）\n" "${UPSHIFT_CONFIRM:-2}"
     _wk=$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)
     printf "  熄屏压档: 上限档=%s (0=QUIET 1=IDLE 2=WARM … -1=关闭) | 当前 mWakefulness=%s\n" \
         "${SCREEN_OFF_MAX_RANK:--1}" "${_wk:-?}"
