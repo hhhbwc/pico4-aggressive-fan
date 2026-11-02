@@ -70,6 +70,38 @@ giving up after `MAX_FAIL_STREAK` rejected writes, and the daemon's `EXIT` trap.
 Uninstall killed the daemon but left the watchdog running; the watchdog then saw a missing
 ownership marker and exited on its own, but only after up to 5 s. It is now stopped explicitly.
 
+### Fixed
+
+**5. The watchdog undid `action.sh set` / `action.sh cycle`.**
+
+Both commands deliberately stop `service.sh` so the daemon cannot overwrite the duty the
+user asked for. The new watchdog saw the ownership marker still present with the daemon
+gone and concluded the daemon had crashed, so it handed the fan back to the vendor — the
+fixed duty lasted only a few seconds. Measured: `action.sh set 60` printed
+"已固定 duty=60%", the fan went to 60% / ~9300 RPM, and within a few seconds the watchdog
+restored the vendor and the duty dropped to 0%.
+
+The watchdog now distinguishes the two cases with a new `state/hold` marker: `action.sh
+set` / `cycle` write it before stopping the daemon, so the watchdog knows the daemon is
+stopped *on purpose* and keeps the duty instead of handing the fan back. It also stops
+the vendor service if the system restarts it and re-asserts the duty if it was lost.
+Verified on-device: `set 60` held 60% / ~9350 RPM for the whole observation window, and
+when the vendor service was deliberately restarted it was stopped again and the duty was
+re-asserted (`watchdog: held duty 60 lost (fan at 0), re-asserting`). `action.sh cycle`
+holds its tier the same way, and `action.sh enable` clears the marker and returns to
+temperature control.
+
+**6. `pkill -f` could kill the user's own shell.**
+
+`action.sh` and `stop.sh` used `pkill -f "$SVC"` as a fallback to stop the daemon. That
+matches the pattern anywhere in a command line, so any process merely *mentioning* the
+path was killed — including the `adb shell` running the command. Observed twice: the
+shell was terminated (exit 143) and, in the `pkill -9` case, killed outright (exit 137).
+
+Both scripts now match on the process's argv instead: a process is only killed when the
+script path is one of its own arguments, which is true of the real daemon and false of a
+shell that merely mentions the path. Verified on-device.
+
 ### Added
 
 - New config key `VENDOR_STOP` (0/1, default 1).

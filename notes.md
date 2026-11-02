@@ -61,6 +61,28 @@ duty（50% / ~8550 RPM），接管标记被清掉。系统在模块接管期间�
 **`stop.sh` 现在也会杀 watchdog。**
 以前卸载只杀守护，watchdog 会残留；它看到接管标记没了最多 5 秒后自己退出，现在改成显式杀掉。
 
+### Fixed
+
+**watchdog 会把手动固定顶掉。**
+`action.sh set` 和 `action.sh cycle` 都会**故意**停掉 `service.sh`（否则守护会按温度把
+用户要的固定值覆盖掉）。但 v2.0.0 新加的 watchdog 看到「接管标记还在、守护没了」就当成
+守护崩溃，于是把风扇交回原厂 —— 固定值只维持了几秒。实测：`action.sh set 60` 打印
+「已固定 duty=60%」，风扇到 60% / ~9300 RPM，几秒后 watchdog 把原厂拉回来，duty 掉回 0%。
+
+现在用新的 `state/hold` 标记区分这两种情况：`set` / `cycle` 在停守护**之前**写下它，
+watchdog 就知道守护是故意停的，改为守住这个 duty 而不是交回原厂；原厂服务被系统拉起来时
+也会再停一次，duty 被抢走就写回去。实机验证：`set 60` 稳定保持 60% / ~9350 RPM；手动重启
+原厂服务后被再次停掉并补写了 duty（`watchdog: held duty 60 lost (fan at 0), re-asserting`）。
+`cycle` 同样守住它切到的档位，`action.sh enable` 会清掉这个标记并恢复温控。
+
+**`pkill -f` 可能误杀用户自己的 shell。**
+`action.sh` 和 `stop.sh` 原来用 `pkill -f "$SVC"` 作兜底。这是子串匹配，任何命令行里
+**提到**这个路径的进程都会被杀 —— 包括执行命令的那条 `adb shell`。实测两次：shell 被
+SIGTERM（exit 143），`pkill -9` 那次直接被 SIGKILL（exit 137）。
+
+现在改成按进程 argv 匹配：只有当脚本路径是进程自己的参数时才杀（真正的守护符合，
+只是「提到」这个路径的 shell 不符合）。实机验证通过。
+
 ### Added
 
 - 新配置键 `VENDOR_STOP`（0/1，默认 1）。

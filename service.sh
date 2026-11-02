@@ -127,6 +127,10 @@ LAST_OK="$STATE_DIR/last_ok"
 GAVE_UP="$STATE_DIR/gave_up"
 PID_FILE="$STATE_DIR/service.pid"
 UPSHIFT_PENDING="$STATE_DIR/upshift_pending"
+# 手动固定/切档时守护会被故意停掉，watchdog 靠 hold 标记守住那个 duty。
+# 守护一旦重新跑起来（restart / 开机 / enable），这个标记就过期了 ——
+# 不清掉的话 watchdog 会继续守着一个不该生效的 duty，把温控顶掉。
+HOLD="$STATE_DIR/hold"
 
 TOOL="/system/bin/gd32ipdclient_test"
 VENDOR_PROP_STATE="sys.pxrfanservice.state"
@@ -990,6 +994,9 @@ main() {
     rm -f "$GAVE_UP" 2>/dev/null
     # 升档确认计数只对连续循环有意义，重启后从零开始。
     rm -f "$UPSHIFT_PENDING" 2>/dev/null
+    # 手动固定/切档留下的 hold 到期了：守护重新跑起来就恢复正常温控，
+    # watchdog 不该再守着一个过期的固定 duty。
+    rm -f "$HOLD" 2>/dev/null
 
     # 修 [5]：用户显式关过 -> 不接管，等 action.sh enable 撤销。
     if [ -f "$DISABLED" ]; then

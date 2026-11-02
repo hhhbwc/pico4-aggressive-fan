@@ -35,6 +35,9 @@ CTRL_MODE="$STATE_DIR/ctrl_mode"
 CUR_DUTY="$STATE_DIR/cur_duty"
 CUR_TIER="$STATE_DIR/cur_tier"
 PINNED="$STATE_DIR/pinned"
+# hold = 守护被故意停掉时要守住的 duty。watchdog 靠它区分「故意停的」
+# 和「守护崩了」—— 前者要守住固定值，后者要把风扇交回原厂。
+HOLD="$STATE_DIR/hold"
 LAST_OK="$STATE_DIR/last_ok"
 GAVE_UP="$STATE_DIR/gave_up"
 PID_FILE="$STATE_DIR/service.pid"
@@ -115,17 +118,37 @@ service_running() {
     svc_pid >/dev/null 2>&1
 }
 
-# 杀掉 service.sh：优先 pid 文件，pgrep/pkill 只作兜底且用完整路径匹配。
+# 杀掉 service.sh：优先 pid 文件；兜底用 /proc 精确匹配。
+#
+# 不用 `pkill -f "$SVC"`：那是子串匹配，任何命令行里**提到**这个路径的进程
+# 都会被杀掉 —— 包括用户自己那条 `adb shell`（实测会把自己的 shell 一起
+# 打死，命令直接返回 143/137）。这里只认「argv 里恰好有且只有这个脚本路径」
+# 的进程，也就是真正在跑的 service.sh。
 kill_service() {
     _p=$(svc_pid 2>/dev/null)
     [ -n "$_p" ] && kill -TERM "$_p" 2>/dev/null
-    pkill -f "$SVC" 2>/dev/null
+    kill_by_argv "$SVC" TERM
     sleep 2
     _p=$(svc_pid 2>/dev/null)
     [ -n "$_p" ] && kill -9 "$_p" 2>/dev/null
-    pkill -9 -f "$SVC" 2>/dev/null
+    kill_by_argv "$SVC" KILL
     rm -f "$PID_FILE" 2>/dev/null
     return 0
+}
+
+# 只杀 argv 里带着指定路径的进程（真在跑那个脚本的）。
+# 用法：kill_by_argv /path/to/service.sh TERM|KILL
+kill_by_argv() {
+    _target="$1"
+    _sig="${2:-TERM}"
+    for _d in /proc/[0-9]*; do
+        _pid="${_d#/proc/}"
+        [ "$_pid" = "$$" ] && continue
+        [ -r "$_d/cmdline" ] || continue
+        if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -Fxq "$_target"; then
+            kill "-$_sig" "$_pid" 2>/dev/null
+        fi
+    done
 }
 
 # enable/on/set/cycle 之后，如果 service.sh 已经因为 disabled 退出，重新拉起它。
@@ -202,7 +225,7 @@ take_over() {
 
 hand_back() {
     _m=$(owner)
-    rm -f "$OWNED" "$CTRL_MODE" "$PINNED"
+    rm -f "$OWNED" "$CTRL_MODE" "$PINNED" "$HOLD"
     if [ "$_m" = "test" ] || [ -f "$IN_TEST" ]; then
         $TOOL setfantestmode 0 >/dev/null 2>&1
         rm -f "$IN_TEST"
@@ -224,7 +247,20 @@ pin_duty() {
     fi
     out=$($TOOL "$(duty_cmd)" "$1" 2>/dev/null)
     case "$out" in
-        *success*) echo "$1" > "$PINNED"; rm -f "$DISABLED"; echo "已固定 duty=$1%" ;;
+        *success*)
+            # 先落 hold 标记，再杀守护 —— 顺序很重要。
+            #
+            # 守护是被**故意**杀掉的（否则它会按温度把固定值覆盖掉）。
+            # v2.0.0 加的 watchdog 看到「接管标记还在但守护没了」会当成
+            # 守护崩溃，于是把风扇交回原厂，用户的固定值当场失效
+            # （实测：set 60 打印成功，几秒后 duty 掉回 0）。
+            # 先写 state/hold，watchdog 就会知道这是手动固定而不是崩溃，
+            # 改为守住这个 duty。
+            echo "$1" > "$HOLD"
+            echo "$1" > "$PINNED"
+            rm -f "$DISABLED"
+            echo "已固定 duty=$1%"
+            ;;
         *) echo "固定失败"; return 1 ;;
     esac
     # Kill service.sh so it does not re-evaluate and override the pin.
@@ -279,6 +315,9 @@ cycle_step() {
                    # 必须同时清掉 pinned：否则 set 之后再 cycle，status 会一直
                    # 显示"手动固定 (duty=50%)"，与刚切到的档位不符。
                    rm -f "$PINNED"
+                   # 但 hold 要写上：守护被故意停掉后，watchdog 得守住这一档，
+                   # 不能把风扇交回原厂（否则刚切到的档位几秒就没了）。
+                   echo "$d" > "$HOLD"
                    kill_service
                    return 0 ;;
         *) echo "切档失败"; return 1 ;;
@@ -419,9 +458,9 @@ case "$CMD" in
         status
         ;;
     enable)
-        if is_pinned; then
-            rm -f "$PINNED"
-        fi
+        # 解除手动固定/切档：hold 也清掉，否则 watchdog 会继续守着一个
+        # 已经不该生效的 duty，把刚接管的温控顶掉。
+        rm -f "$PINNED" "$HOLD"
         if take_over; then
             : > "$ENABLED"
             rm -f "$DISABLED" "$GAVE_UP"

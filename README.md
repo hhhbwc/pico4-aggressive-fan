@@ -84,6 +84,13 @@ mechanisms cover that:
 2. `watchdog.sh` (new in v2.0.0) polls every 5 s. If `service.sh` was killed with `-9` — the one
    case where the `EXIT` trap cannot run — it restarts the vendor service and clears the ownership
    markers. Verified on-device: the vendor was back within ~5 s.
+
+   The watchdog also tells "the daemon was stopped on purpose" apart from "the daemon crashed".
+   `action.sh set` / `action.sh cycle` stop the daemon deliberately so it cannot overwrite the duty
+   you asked for; they record that duty in `state/hold` first, and the watchdog then keeps the
+   duty instead of handing the fan back. It also stops the vendor if the system restarts it and
+   re-asserts the duty if it was lost. `action.sh enable` clears the marker and returns to
+   temperature control.
 3. If the vendor service is restarted by the system while the module holds the fan, the watchdog
    stops it again, and the main loop re-writes the duty.
 
@@ -419,6 +426,12 @@ setprop ctl.stop pxrfanservice                  # 竞争者没了
    连续写失败后放弃、守护自身的 `EXIT` trap。
 2. `watchdog.sh`（v2.0.0 新增）每 5 秒检查一次。如果是 `kill -9` 打死 `service.sh`——
    唯一 `EXIT` trap 跑不到的情况——它会重启原厂服务并清掉接管标记。实机验证：约 5 秒内原厂就回来了。
+
+   watchdog 还能区分「守护是被故意停的」和「守护崩了」。`action.sh set` / `action.sh cycle`
+   会故意停掉守护，免得它按温度把你要的固定值覆盖掉；这两个命令会先把 duty 写进
+   `state/hold`，watchdog 于是知道守护是故意停的，改为守住这个 duty，而不是把风扇交回原厂。
+   原厂服务被系统拉起来时它也会再停一次，duty 被抢走就写回去。`action.sh enable` 会清掉这个
+   标记并恢复温控。
 3. 如果系统在模块接管期间又把原厂服务拉起来，watchdog 会再次停掉它，主循环也会重写 duty。
 
 如果 `pxrfanservice` 停不掉、或者 `setfanspeed` 被拒，模块会自动退回 v1.x 的 test mode 通路，
@@ -753,6 +766,13 @@ setprop ctl.stop pxrfanservice                  # конкурент убран
    через `-9` — единственный случай, когда `EXIT`-trap не сработает, — он перезапускает
    vendor-сервис и снимает маркеры владения. Проверено на устройстве: vendor вернулся примерно
    за 5 с.
+
+   Watchdog также отличает «демон остановлен намеренно» от «демон упал». `action.sh set` и
+   `action.sh cycle` останавливают демон намеренно, чтобы он не перезаписал запрошенный duty;
+   они сначала записывают этот duty в `state/hold`, и тогда watchdog удерживает его, а не
+   возвращает вентилятор vendor-у. Он также останавливает vendor, если система его перезапустила,
+   и восстанавливает duty, если тот был потерян. `action.sh enable` очищает метку и возвращает
+   управление по температуре.
 3. Если система перезапустила vendor-сервис, пока модуль держит вентилятор, watchdog снова его
    останавливает, а основной цикл перезаписывает duty.
 
